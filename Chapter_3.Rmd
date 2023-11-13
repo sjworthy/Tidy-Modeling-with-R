@@ -1,0 +1,233 @@
+---
+title: "Chapter_3"
+author: "Sam Worthy"
+date: "2023-11-12"
+output: html_notebook
+---
+
+```{r}
+library(tidyverse)
+library(modeldata)
+```
+
+
+# 3. A Review of R Modeling Fundamentals
+
+## 3.1 An Example
+
+Relationship between the ambient temperature and the rate of cricket chirps per minute. Data were collected for two species: O. exclamationis and O. niveus, with a total of 31 data points.
+
+```{r}
+data(crickets, package = "modeldata")
+names(crickets)
+
+# Plot the temperature on the x-axis, the chirp rate on the y-axis. The plot
+# elements will be colored differently for each species:
+ggplot(crickets, 
+       aes(x = temp, y = rate, color = species, pch = species, lty = species)) + 
+  # Plot points for each data point and color by species
+  geom_point(size = 2) + 
+  # Show a simple linear model fit created separately for each species:
+  geom_smooth(method = lm, se = FALSE, alpha = 0.5) + 
+  scale_color_brewer(palette = "Paired") +
+  labs(x = "Temperature (C)", y = "Chirp Rate (per minute)")
+```
+
+To fit an ordinary linear model in R, the lm() function is commonly used. The important arguments of this function are the model formula and the data frame.
+
+A main effect is a model term that contains a single predictor variable.
+
+Most common approach to encode factors as numeric is to use indicator variables, also known as dummy variables, in place of the original qualitative values. 
+
+The model formulat rate ~ temp + species creates a model with different y-intercepts for each species; the slopes of the regression lines coudl be different for each species as well. To accommodate this structure, an interaction term can be added to the model.
+
+Ways to specify interaction term:
+
+* rate ~ temp + species + temp:species
+* rate ~ (temp + species)^2
+* rate ~ temp*species
+
+In-line functions can be used in the formula. Example, rate ~ log(temp). Since the formula is symbolic by default, literal math can also be applied to the predictors using the identity function I(). Example, rate ~ I(temp(*9/5)+32). Another useful formula is poly(x,3) which adds linear, quadratic, and cubic terms for x to the model as main effects. For data sets where there are many predictors, the period shortcut is available. The period represents main effects for all of the columns that are not on the left-hand side of the tilde. Example, rate ~ (.)^3, would add main effects as well as two- and three-variable interactions to the model.
+
+Example using a two-way interaction model. Book uses suffix _fit for R objects that are fitted models.
+
+```{r}
+interaction_fit <-  lm(rate ~ (temp + species)^2, data = crickets) 
+
+# To print a short summary of the model:
+interaction_fit
+```
+
+Assessing model fit using diagnostic plots. We can use the plot() method for lm objects. 
+```{r}
+# Place two plots next to one another:
+par(mfrow = c(1, 2))
+
+# Show residuals vs predicted values:
+plot(interaction_fit, which = 1)
+
+# A normal quantile plot on the residuals:
+plot(interaction_fit, which = 2)
+```
+
+Above are residual diagnostic plots for the linear model with interactions, which appear reasonable enough to conduct inferential analysis. 
+
+Assess if the inclusion of the interaction term is necessary. The most appropriate approach for this model is to recompute the model without the interaction term and use the anova() method.
+
+```{r}
+# Fit a reduced model:
+main_effect_fit <-  lm(rate ~ temp + species, data = crickets) 
+
+# Compare the two:
+anova(main_effect_fit, interaction_fit)
+```
+
+The statistical test generates a p-value of 0.25. This implies that there is a lack of evidence against the null hypothesis that the interaction term is not needed by the model. For this reason, we will conduct further analysis on the model without the interaction.
+
+Can use the summary() method to inspect the coefficients, standard errors, and p-values.
+
+```{r}
+summary(main_effect_fit)
+```
+
+The chirp rate for each species increases by 3.6 chirps as the temperatures increases by a single degree. The species term indicates that, across all temperature values, O. nivesu has a chirp rate that is about 10 fewer chirps per minute than O. exclamationis.The intercept value indciates that at 0 degrees C, there are negative chirps per minute for both species, doesn't make sense and it actually an extrapolation since the lowest actual temperature is 17.2 deg C.
+
+If we needed to estimate the chirp rate at a temperature that was not observed in the experiment, we could use the predict() method. It takes the model object and a data frame of new values for prediction. 
+
+```{r}
+new_values <- data.frame(species = "O. exclamationis", temp = 15:20)
+predict(main_effect_fit, new_values)
+```
+
+
+Major features important for the rest of the book:
+
+* the language has an expressive syntax for specifying model terms
+* The R formula method has many conveniences for modeling that are also applied to new data when predictions are generated.
+* There are numerous helping functions (e.g. anova(), summary(), predict()) that you can use to conduct specific calculations after the fitted model is created. 
+
+## 3.2 What does the R formula do?
+
+It usually serves multiple purposes:
+
+* defines the columns that the model uses
+* the standard R machinery uses the formula to encode the columns into an appropriate format
+* the roles of the columns are defined by the formula
+
+## 3.3 Why tidiness is important for modeling
+
+Three common methods for creating a scatter plot of two numeric variables in a data frame called plot_data. In these three cases, separate groups of developers devised three distinct interfaces for the same task.
+
+```{r}
+plot(plot_data$x, plot_data$y)
+
+library(lattice)
+xyplot(y ~ x, data = plot_data)
+
+library(ggplot2)
+ggplot(plot_data, aes(x = x, y = y)) + geom_point()
+```
+
+Heterogeneous argument names for making predictions different modeling functions.
+
+1. lda(), from MASS, predict(object)
+2. glm(), from stats, predict(object, type = "response")
+3. gbm(), from gbm, predict(object, type = "response, n.trees")
+4. mda(), from mda, predict(object, type = "posterior")
+5. rpart(), from rpart, predict(object, type = "prob")
+6. various, from RWeka, predict(object, type = "probability")
+7. logitboost(), from LogitBoost, predict(object, type = "raw", nIter)
+8. pamr.train(), from pamr, pamr.predict(object, type = "posterior")
+
+R language has conventions for missing data that are handled inconsistently. The general rule is that missing data propogate more missing data; the average of a set of values with a missing data point is itself missing and so on. There are several options baked in to R at this point with the generic function na.action(). This sets the policy for how a function should behave if there are missing values. The two most common policies are na.fail() and na.omit(). The former produces an error if missing data are present while the latter removes the missing data prior to calculations by case-wide deletions. 
+
+```{r}
+# Add a missing value to the prediction set
+new_values$temp[1] <- NA
+
+# The predict method for `lm` defaults to `na.pass`:
+predict(main_effect_fit, new_values)
+
+# Alternatively 
+predict(main_effect_fit, new_values, na.action = na.fail)
+
+predict(main_effect_fit, new_values, na.action = na.omit)
+```
+
+The broom:tidy() function is another tool for standardizing the structure of R objects. It can return many types of R objects in a more usable format. For example, suppose that predictors are being screened based on their correlation to the outcome column. Using purrr::map(), the results from cor.test() can be returned in a list for each predictor.
+
+```{r}
+corr_res <- map(mtcars %>% select(-mpg), cor.test, y = mtcars$mpg)
+
+# The first of ten results in the vector: 
+corr_res[[1]]
+```
+
+If we want to use the results in a plot, the standard format of hypothesis rest results are not very useful. The tidy() method can return this as a tibble with standardized names.
+
+```{r}
+library(broom)
+
+tidy(corr_res[[1]])
+```
+
+These results can be "stacked" and added to a ggplot()
+
+```{r}
+corr_res %>% 
+  # Convert each to a tidy format; `map_dfr()` stacks the data frames 
+  map_dfr(tidy, .id = "predictor") %>% 
+  ggplot(aes(x = fct_reorder(predictor, estimate))) + 
+  geom_point(aes(y = estimate)) + 
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = .1) +
+  labs(x = NULL, y = "Correlation with mpg")
+```
+
+## 3.4 Combining Base R models and the tidyverse
+
+For example, if we wanted to fit separate models for each cricket species, we can first break out the cricket data by this column using dplyr::group_nest()
+
+```{r}
+split_by_species <- 
+  crickets %>% 
+  group_nest(species) 
+split_by_species
+```
+
+From this, purrr:map() function can create individual models for each species.
+
+```{r}
+model_by_species <- 
+  split_by_species %>% 
+  mutate(model = map(data, ~ lm(rate ~ temp, data = .x)))
+model_by_species
+```
+
+To collect the coefficients for each of the models, use broom::tidy() to convert them to a consistent data frame format so that they can be unnested.
+
+```{r}
+model_by_species %>% 
+  mutate(coef = map(model, tidy)) %>% 
+  select(species, coef) %>% 
+  unnest(cols = c(coef))
+```
+
+## 3.5 The tidymodels metapackage
+
+```{r}
+library(tidymodels)
+```
+
+There are a few ways to handle naming conflicts. The functions can be called with its namespace (e.g. stats::filter()). Another option is to use the conflicted package. We can set a rule that remains in effects until the end of the R session to ensure that one specific function will always run if no namespace is given in the code. As an example, if we prefer the dplyr version of the previous function:
+
+```{r}
+library(conflicted)
+conflict_prefer("filter", winner = "dplyr")
+```
+
+For convenience, tidymodels contains a function that captures most of the common naming conflicts that we might encounter:
+
+```{r}
+tidymodels_prefer(quiet = FALSE)
+```
+

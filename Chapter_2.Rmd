@@ -1,0 +1,211 @@
+---
+title: "Chapter 2"
+author: "Sam Worthy"
+date: "2023-11-12"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r}
+library(tidyverse)
+library(dplyr)
+library(rsample)
+library(ggplot2)
+library(lubridate)
+```
+
+
+# 2. A Tidyverse Primer
+
+## 2.1 Tidyverse principles
+
+* Design for humans
+  + use function names that are descriptive and explicit over those that are short and implicit.
+* Reuse existing data structures
+* Design for the pipe and functional programming
+
+### 2.1.1
+
+contrast tidyverse approach with traditional R
+
+```{r}
+data("mtcars")
+```
+
+To sort the data frame using one or more columns traditionally, using the order () function, cannot use the more intuitive sort() function
+
+```{r}
+mtcars[order(mtcars$gear, mtcars$mpg),]
+```
+
+In dplyr, the tidyverse function is arrange()
+
+```{r}
+library(dplyr)
+arrange(.data = mtcars, gear, mpg)
+```
+
+### 2.1.2 
+
+Data frame is the preferred data structure in tidyverse and tidymodels, specifically the tibble, a modern reimagiing of R's data frame.
+
+As an example, the rsample package can be used to create resamples of a data set. The resampling functions return a tibble with a column called splits.
+
+```{r}
+boot_samp = rsample::bootstraps(mtcars, times = 3)
+boot_samp
+class(boot_samp)
+```
+
+With this approach, vector-based functions can be used with these columns. The boot_samp object has multiple classes but inherits mthods for data frame and tibbles.
+
+### 2.1.3
+
+The magrittr pipe operator (%>%) is a tool for chaining together a sequence of R functions.
+
+```{r}
+small_mtcars = arrange(mtcars, gear)
+small_mtcars = slice(small_mtcars, 1:10)
+```
+
+more compactly
+
+```{r}
+small_mtcars = slice(arrange(mtcars,gear),1:10)
+```
+
+The pipe operator substitutes the value of the left-hand side of the operator as the first arguement to the right-hand side
+
+```{r}
+small_mtcars = mtcars %>% 
+  arrange(gear) %>% 
+  slice(1:10)
+```
+
+Piping is not unlike the layering of plot components into a ggplot object with the + operator
+
+```{r}
+ggplot(mtcars, aes(x = wt, y = mpg)) +
+  geom_point() +
+  geom_smooth(method = lm)
+```
+
+Suppose you are interested in the logarithm of the ratio of the fuel efficiency to the car weight. A loop might seem like a good option.
+
+```{r}
+n = nrow(mtcars)
+ratios = rep(NA_real_, n)
+for(car in 1:n){
+  ratios[car] = log(mtcars$mpg[car]/mtcars$wt[car])
+}
+head(ratios)
+```
+
+Vectorized version
+
+```{r}
+ratios = log(mtcars$mpg/mtcars$wt)
+```
+
+Often, element-wise operation of interest is too complex for a vectorized solution. A good approach is to write a function to do the computations. 
+
+```{r}
+compute_log_ratio <- function(mpg, wt) {
+  log_base = getOption("log_base",default = exp(1)) # get external data
+  results = log(mpg/wt, base = log_base)
+  print(mean(results)) # prints to the console
+  done <<-TRUE # sets external data
+  results
+}
+```
+
+A better version would be
+
+```{r}
+compute_log_ratio <- function(mpg, wt, log_base = exp(1)) {
+  log(mpg/wt, base = log_base)
+}
+```
+
+The purrr package contains tools for functional programming. The map() family of functions operators on vectors and always returns the same type of output. The most basic function, map(), always returns a list and uses the basic syntax of map(vector, function)
+
+```{r}
+map(head(mtcars$mpg,3),sqrt)
+```
+
+There are specialized variants of map() that return values when we know or expect that the fucntion will generate one of the basic vector types. 
+
+```{r}
+map_dbl(head(mtcars$mpg,3),sqrt)
+```
+
+Also mapping functions that operature across multiple vectors
+
+```{r}
+log_ratios = map2_dbl(mtcars$mpg, mtcars$wt, compute_log_ratio)
+head(log_ratios)
+```
+
+The map() funcitons also allow for temporary, anonymous functions defined using the tilde character. The arguement values are .x and .y for map2()
+
+```{r}
+map2_dbl(mtcars$mpg, mtcars$wt, ~ log(.x/.y)) %>% 
+  head()
+```
+
+## 2.2 Examples
+
+Tibbles have slightly different rules than basic data frames in R. For example, tibbles naturallly work with column names that are not syntactically valid variable names.
+
+```{r}
+# wants valid names:
+data.frame(`variable 1` = 1:2, two = 3:4)
+# But can be coerced to use them with an extra option:
+df = data.frame(`variable 1` = 1:2, two = 3:4, check.names = FALSE)
+df
+# But tibbles just work:
+tbbl = tibble(`variable 1` = 1:2, two = 3:4)
+tbbl
+```
+
+Standard data frames enable partial matching of arguments so that code uisng only a portion of the column names still works. Tibbles prevent this from happening since it can lead to accidental errors.
+
+```{r}
+df$tw
+
+tibble$tw
+```
+
+Tibbles are prevent one of the most common R errors: dropping dimensions. If a standard data frame subsets the columns down to a signle column, the object is converted to a vector. Tibbles never do this.
+
+```{r}
+df[,"two"]
+tbbl[,"two"]
+```
+Demonstration of syntax.
+
+This data set comes from the city of Chicago's data portal and contains daily ridership data for the city's elevated train stations.
+
+* the station identifier (numeric)
+* the station name (character)
+* the date (character in mm/dd/yyyy format)
+* the day of the week (character)
+* the number of riders (numeric)
+
+```{r}
+url <- "https://data.cityofchicago.org/api/views/5neh-572f/rows.csv?accessType=DOWNLOAD&bom=true&format=true"
+
+all_stations <- 
+  # Step 1: Read in the data.
+  read_csv(url) %>% 
+  # Step 2: filter columns and rename stationname
+  dplyr::select(station = stationname, date, rides) %>% 
+  # Step 3: Convert the character date field to a date encoding.
+  # Also, put the data in units of 1K rides
+  mutate(date = mdy(date), rides = rides / 1000) %>% 
+  # Step 4: Summarize the multiple records using the maximum.
+  group_by(date, station) %>% 
+  summarize(rides = max(rides), .groups = "drop")
+```
+

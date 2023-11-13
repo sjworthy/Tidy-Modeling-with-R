@@ -1,0 +1,85 @@
+---
+title: "Chapter 1"
+author: "Sam Worthy"
+date: "2023-11-12"
+output:
+  html_document:
+    df_print: paged
+---
+
+# Chapter 1
+## 1. Software for Modeling
+
+Two reasons that models permeat our lives today:
+
+1. an abundance of software exists to create models
+2. it has become easier to capture and store data, as well as make it accessible
+
+### 1.1
+R is open source and free. It is a powerful programming language that can be used for many different purposes but specializes in data analysis, modeling, visualization, and machine learning.
+
+### 1.2 Types of Models
+
+* Descriptive Models
+  + describe or illustrate characteristics of some data.
+  + LOESS, locally estimated scatterplot smoothing model
+* Inferential Models
+  + produce a decision for a research question or to explore a specific hypothesis, similar to how statistical tests are used
+  + typically produce some type of probabilistic output
+    ++ p-value, confidence interval, posterior probability
+* Predictive Models
+  + predicted values have the highest possible fidelity to the true value of the new data
+  + problem type is one of estimation rather than inference
+  + mechanistic model could be derived using first principles to produce a model equation that depends on assumptions.
+  + empirically driven models are created with more vague assumptions, tend to fall into the machine learning category
+  
+### 1.3 
+
+Book defines the type of a model by how it is used, rather than its mathematical qualities.
+
+ordinal linear regression model might fall into any of 3 classes of model
+
+1. descriptive smoother, restricted smoothing splines
+2. ANOVA, analysis of variance
+3. simple linear regression model
+
+### 1.4 Terminology
+
+#### supervised versus unsupervised
+  
+Unsupervised models are those that learn patterns, clusters, or other characteristics of the data but lack an outcome, i.e. dependent variable. Examples: PCA, clustering, autoencoders
+
+Supervised models are those that have an outcome variable. Examples: linear regression, neural networks, etc. Two main sub-categories of supervised models, regression that predicts a numeric outcome, and classification that predicts an outcome that is an ordered or unordered set of qualitative values.
+
+outcomes are the dependent variables
+
+predictors are the independent variables
+
+Data or variables themselves are typically quantitative or qualitative. Qualitative values are also known as nominal data.
+
+### 1.5
+
+Critical phases that always come before modeling
+
+* cleaning of data
+* understanding the data or exploratory data analysis (EDA)
+* clear expectations of the model's goal and how performance will be judged
+
+General phases of modeling
+
+1. exploratory data analysis
+2. feature engineering, creation of specific model terms
+3. model tuning and selection
+4. model evaluation
+
+
+
+
+
+
+
+
+
+
+
+
