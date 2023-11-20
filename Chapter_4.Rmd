@@ -1,0 +1,73 @@
+---
+title: "Chapter_4"
+author: "Sam Worthy"
+date: "2023-11-19"
+output: html_notebook
+---
+
+# 4. The Ames Housing Data
+
+We will walk through exploratory data analysis of the data set.
+
+Data set contains information on 2,930 properties in Ames, Iowa including columns related to:
+
+* house characteristics (bedrooms, garage, fireplace, pool, porch, etc.)
+* location (neighborhood)
+* lot information (zoning, shape, size, etc.)
+* ratings of condition and quality
+* sale price
+
+Modeling Goal: to predict the sale price of a house based on other information we have.
+
+```{r}
+library(modeldata)
+data(ames)
+dim(ames)
+```
+
+## 4.1 Exploring features of homes in Ames
+
+outcome we want to predict: the last sale price o fthe house (in USD). 
+
+Histogram to see the distribution of sale prices:
+
+```{r}
+library(tidymodels)
+tidymodels_prefer()
+
+ggplot(ames, aes(x = Sale_Price)) +
+  geom_histogram(bins = 50, col = "white")
+```
+
+The plot shows us that the data are right-skewed; there are more inexpensive houses than expensive ones. A strong argument can be made that the price should be log-transformed. 
+
+Visualize the transformed data
+
+```{r}
+ggplot(ames, aes(x = Sale_Price)) +
+  geom_histogram(bins = 50, col = "white") +
+  scale_x_log10()
+```
+
+Cons of log-transformation:
+
+1. units of the model coefficients might be difficult to interpret
+2. measures of performance may be difficult to interpret. For example, root mean squared error (RMSE) is a common metric in regression models. It used the difference between observed and predcited values in its calculations. If the sale price is on the log scale, these differenes (i.e. the residuals) are also on the log scale. 
+
+```{r}
+ames = ames %>% mutate(Sale_Price = log10(Sale_Price))
+```
+
+Spatial information is contained in the data in two ways:
+
+1. a qualitative Neighborhood label
+2. a quantitative longitude and latitude data
+
+Basic questions that could be examined during the exploratory stage:
+
+* Is there anything odd or noticeable about the distributions of the individuals predictors? Is there much skewness or any pathological distributions?
+* Are there high correlations between predictors? Are some redundant?
+* Are there associations between predictors and the outcomes?
+
+
+

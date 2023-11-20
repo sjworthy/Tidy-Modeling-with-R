@@ -1,0 +1,244 @@
+---
+title: "Chapter_6"
+author: "Sam Worthy"
+date: "2023-11-19"
+output: html_notebook
+---
+
+Code to get started from previous chapters:
+
+```{r}
+library(tidymodels)
+data(ames)
+ames <- ames %>% mutate(Sale_Price = log10(Sale_Price))
+```
+
+
+```{r}
+library(tidymodels)
+data(ames)
+ames <- ames %>% mutate(Sale_Price = log10(Sale_Price))
+
+set.seed(502)
+ames_split <- initial_split(ames, prop = 0.80, strata = Sale_Price)
+ames_train <- training(ames_split)
+ames_test  <-  testing(ames_split)
+```
+
+
+# 6. Fitting models with parsnip
+
+The parsnip package provides a fluent and standardized interface for a variety of different models. We will focus on how to fit() and predict() directly with a parsnip object. 
+
+# 6.1 Create a model
+
+Suppose that a linear regression model was our initial choice. This is equivalent to specifying that the outcome data is numeric and that the predictors are related to the outcome in terms of simple slopes and intercepts. 
+
+yi = Beta0 + Beta1x1i + ... + Betapxpi
+
+A variety of methods can be used to estimate the model parameters:
+
+* ordinary linear regression uses the traditional method of least squares to solve for the model parameters
+* regularized linear regression adds a penalty to the least squares method to encourage simplicity by removing predictors and/or shrinking their coefficients toward zero. This can be exectued using Bayesian or non-Bayesian techniques.
+
+The stats package can be used for the first case. The syntax for linear regression using the function lm(), where ... symbolizes other options to pass to lm().The function does not have any x/y interface, where we might pass in our outcome as y and our predictors as x. 
+
+```{r}
+model = lm(formulat, data, ...)
+```
+
+To estimate with regularization, a Bayesian model can be fit using the rstanarm package where the other options passed via ... would include arguments for the prior distributions of the parameters as well as specifics about the numerical aspects of the model.
+
+```{r}
+model = stan_glm(formula, data, family = "gaussian", ...)
+```
+
+A population non-Bayesian approach to regularized regression is the glmnet model. In this case, the predictor data must already be formatted into a numeric matrix; there is only a x/y method and no formula method
+
+```{r}
+model <- glmnet(x = matrix, y = vector, family = "gaussian", ...)
+```
+
+Pros of tidymodels:
+
+* specify the type of model based on its mathematical strucutre (e.g. linear regression, random forest, KNN, etc.)
+* specify the engine for fitting the model. Most often this reflects the software package that should be used. 
+* When required, declare the mode of the model. The mode reflects the type of prediction outcome. For numeric outcomes ,the mode is regression. For qualitative outcomes, it is classification. 
+
+```{r}
+library(tidymodels)
+tidymodels_prefer()
+
+linear_reg() %>% set_engine("lm")
+
+linear_reg() %>% set_engine("glmnet") 
+
+linear_reg() %>% set_engine("stan")
+```
+
+Once the details of the model have been specified, the model estimation can be done with either the fit() function (to use a formula) or the fit_xy() function (when your data are already pre-processed). 
+
+The translate() function can provide details on how parsnip converts the user's code to the package's syntax. 
+
+```{r}
+linear_reg() %>% set_engine("lm") %>% translate()
+
+linear_reg(penalty = 1) %>% set_engine("glmnet") %>% translate()
+
+linear_reg() %>% set_engine("stan") %>% translate()
+```
+
+How to predict the sale price of houses in the Ames data as a function of only longitude and latitude.
+
+```{r}
+lm_model <- 
+  linear_reg() %>% 
+  set_engine("lm")
+
+lm_form_fit <- 
+  lm_model %>% 
+  # Recall that Sale_Price has been pre-logged
+  fit(Sale_Price ~ Longitude + Latitude, data = ames_train)
+
+lm_xy_fit <- 
+  lm_model %>% 
+  fit_xy(
+    x = ames_train %>% select(Longitude, Latitude),
+    y = ames_train %>% pull(Sale_Price)
+  )
+
+lm_form_fit
+lm_xy_fit
+```
+
+parsnip enables a consistent model interface for different packages. It also provides consistency in the model arguments. 
+
+To understand how the parsnip argument names map to the original names, use the help file for the model as well as the translate() function. 
+
+```{r}
+rand_forest(trees = 1000, min_n = 5) %>% 
+  set_engine("ranger") %>% 
+  set_mode("regression") %>% 
+  translate()
+```
+
+Modeling functions in parsnip separate model arguments into two categories:
+
+* main arguments are more commonly used and tend to be available across engines.
+* engine arguments are either specific to a particular engine or used more rarely. These arguments can be specificed in set_engine().
+
+```{r}
+rand_forest(trees = 1000, min_n = 5) %>% 
+  set_engine("ranger", verbose = TRUE) %>% 
+  set_mode("regression") 
+```
+
+## 6.2 Use the model results
+
+Several quantities are stored in a parsnip model object, including the fitted model. This can be found in an element called fit, which can be returned using the extract_fit_engine() function:
+
+```{r}
+lm_form_fit %>% extract_fit_engine()
+```
+
+Normal methods can be applied to this object, such as printing and plotting:
+
+```{r}
+lm_form_fit %>% extract_fit_engine() %>% vcov()
+```
+
+Never pass the fit element of a parsnip model to a model prediction function, i.e. use predict (lm_form_fit), but do NOT use predict(lm_form_fit$fit). If the data were preprocessed in any way, incorrect predictions will be generated. 
+
+One issue with some existing methods in base R is that the results are stored in a manner that may not be the most useful.
+
+```{r}
+model_res <- 
+  lm_form_fit %>% 
+  extract_fit_engine() %>% 
+  summary()
+
+# The model coefficient table is accessible via the `coef` method.
+param_est <- coef(model_res)
+class(param_est)
+
+param_est
+```
+
+The object is a numeric matrix. The non-numeric data (the labels for the coefficients) are contained in the row names. 
+
+A reasonable next step might be to create a visualization of the parameter values. To do this, it would be sensible to convert the parameter matrix to a data frame. A solution for conversion is the broom package. For example, using the tidy() method on the linear model produces:
+
+```{r}
+tidy(lm_form_fit)
+```
+
+The column names are standardized across models and do not contain any additional data.
+
+## 6.3 Make predictions
+
+Another area where parsnip diverges from conventional R modeling functions is the format of values returned from predict(). For predictions, parsnip always conforms to the following rules:
+
+* the results are always a tibble
+* the column names of the tibble are always predictable
+* there are always as many rows in the tibble as there are in the input data set.
+* the row order of the predictions are always the same as the original data. 
+
+```{r}
+ames_test_small <- ames_test %>% slice(1:5)
+predict(lm_form_fit, new_data = ames_test_small)
+
+```
+
+These three rules make it easier to merge predictions with the original data.
+
+```{r}
+ames_test_small %>% 
+  select(Sale_Price) %>% 
+  bind_cols(predict(lm_form_fit, ames_test_small)) %>% 
+  # Add 95% prediction intervals to the results:
+  bind_cols(predict(lm_form_fit, ames_test_small, type = "pred_int")) 
+```
+
+The third rule regarding the number of rows in the output is critical. For example, if any rows of the new data contain missing values, the output will be padded with missing results for those rows. 
+
+Suppose that we used a decision tree to model the Ames data. Outside of the model specification, there are no significant differences in the code pipeline:
+
+```{r}
+tree_model <- 
+  decision_tree(min_n = 2) %>% 
+  set_engine("rpart") %>% 
+  set_mode("regression")
+
+tree_fit <- 
+  tree_model %>% 
+  fit(Sale_Price ~ Longitude + Latitude, data = ames_train)
+
+ames_test_small %>% 
+  select(Sale_Price) %>% 
+  bind_cols(predict(tree_fit, ames_test_small))
+```
+
+# 6.5 Creating model specifications
+
+The parsnip package includes an RStudio addin that can help with remembers how to write the code to generate many models. Either choosing this addin from the Addins toolbar menu or running the code will open a window in the Viewer panel of the RStudio IDe with a list of possible models for each model mode. These can be written to the source code panel. 
+
+```{r}
+parsnip_addin()
+```
+
+
+# code needed moving forward
+
+```{r}
+library(tidymodels)
+data(ames)
+ames <- mutate(ames, Sale_Price = log10(Sale_Price))
+
+set.seed(502)
+ames_split <- initial_split(ames, prop = 0.80, strata = Sale_Price)
+ames_train <- training(ames_split)
+ames_test  <-  testing(ames_split)
+
+lm_model <- linear_reg() %>% set_engine("lm")
+```
+

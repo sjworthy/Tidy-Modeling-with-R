@@ -1,0 +1,104 @@
+---
+title: "Chapter_5"
+author: "Sam Worthy"
+date: "2023-11-19"
+output: html_notebook
+---
+
+# 5. Spending our Data
+
+When there is a lot of data available, a smart strategy is to allocate specific subsets of data for different tasks, as opposed to allocating the largest possible amount (or even all) to the model parameter estimation only. 
+
+This chapter demostrates the basics of splitting (i.e. creating a data budget) for our initial pool of samples for different purposes.
+
+## 5.1 Common methods for splitting data
+
+Primary approach is to spilt the existing data into two distinct sets.
+
+1. Training set, usually the majority of the data
+2. Test set, held in reserve until one or two models are chosen as the methods most likely to succeed. Used as the final arbiter to determine the efficacy of the model 
+
+Most common method for splitting is to use simple random sampling. The rsample package has tools for making data splits, such as initial_split(). It takes the data frame as an argument as well as the proportion to be placed into training. 
+
+```{r}
+library(tidymodels)
+tidymodels_prefer()
+
+# Set the random number stream using `set.seed()` so that the results can be 
+# reproduced later. 
+set.seed(501)
+
+# Save the split information for an 80/20 split of the data
+ames_split <- initial_split(ames, prop = 0.80)
+ames_split
+```
+
+Printed information denotes amount of data in the training set (n = 2,344), amount in the test set (n = 586), the size of the original pool of samples (n = 2,930).
+
+The object ames_split is an rsplit object and contains only the partitioning information, to get the resulting data sets, we apply two more functions.
+
+```{r}
+ames_train <- training(ames_split)
+ames_test  <-  testing(ames_split)
+
+dim(ames_train)
+```
+
+Stratified sampling can be used when there is a dramatic class imbalance in classification problems, one class occurs much less frequently than another. The training/test split is conducted separately within each class and then these subsamples are combined into the overall training and test set. 
+
+In the ames data, because it is right skewed, the worry is that with simple splitting more expensive houses would not be well represented int he training set which would increase the risk that the model would be ineffective at prediction. 
+
+A stratified random sample would conduct the 80/20 split within each of these data subsets and then pool the results. This is achieved in rsample using strata
+
+```{r}
+set.seed(502)
+ames_split <- initial_split(ames, prop = 0.80, strata = Sale_Price)
+ames_train <- training(ames_split)
+ames_test  <-  testing(ames_split)
+
+dim(ames_train)
+```
+
+Random sampling is not the best choice when data have a significant time component, such as time series data. Here it is more common to use the most recent data as the test set. The initial_time_split function in rsample uses the prop argument to denote what proportion of the first part of the data should be used as the training set; the function assumes that the data have been pre-sorted in an appropriate order. 
+
+## 5.2 What about a validation set?
+
+How can we tell what is best if we don't measure performance until the test set?
+
+The validation set was a means to get a rough sense of how well the model performed prior to the test set. 
+
+If you are going to use a validation set, you can start with a different splitting function.
+
+```{r}
+set.seed(52)
+# To put 60% into training, 20% in validation, and 20% in testing:
+ames_val_split <- initial_validation_split(ames, prop = c(0.6, 0.2))
+ames_val_split
+```
+
+* training set = 1758
+* validation set = 586
+* testing set = 586
+* total = 2930
+
+separate data sets
+
+```{r}
+ames_train <- training(ames_val_split)
+ames_test <- testing(ames_val_split)
+ames_val <- validation(ames_val_split)
+```
+
+## 5.3 Multilevel Data
+
+A property is considered to be the independent experimental unit. Data splitting should occur at the independent experimental unit level of the data.
+
+## 5.4 Other considerations
+
+1. First, it is critical to quarantine the test set from any model building activities.
+2. techniques to subsample the training set can mitigate specific issues (e.g. class imbalances). 
+
+
+When training a final chosen model for production, after ascertainin the expected performance on new data, practitioners often use all available data for better parameter estimation. 
+
+
