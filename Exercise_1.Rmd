@@ -1,0 +1,120 @@
+---
+title: "Exercise_1"
+author: "Sam Worthy"
+date: "2023-11-26"
+output: html_notebook
+---
+
+```{r}
+library(tidymodels)
+library(multilevelmod)
+tidymodels_prefer()
+```
+
+We are using the built-in ChickWeight dataset
+
+```{r}
+data(ChickWeight)
+# then it is an object in your environment
+summary(ChickWeight)
+```
+
+### Use rsample to create training and test sets from ChickWeight
+
+Each chick only received one diet so need to split by chicks acrosss diets
+
+```{r}
+chick.split = group_initial_split(ChickWeight,Chick)
+chick.split
+```
+
+```{r}
+chicks.training = training(chick.split)
+chicks.testing = testing(chick.split)
+```
+
+
+### Fit Linear Model Additive
+Fit a linear model to ChickWeight training dataset, modeling weight as a function of diet and time (and their interaction?), using parsnip tools.
+
+```{r}
+lm.model <- 
+  linear_reg() %>% 
+  set_engine("lm")
+
+chicks.lm.fit <- 
+  lm.model %>% 
+  fit(weight ~ Diet + Time, data = chicks.training)
+
+chicks.lm.fit
+tidy(chicks.lm.fit)
+```
+
+### Fit Linear Model Interaction
+
+```{r}
+lm.model <- 
+  linear_reg() %>% 
+  set_engine("lm")
+
+chicks.lm.fit.interact <- 
+  lm.model %>% 
+  fit(weight ~ Diet + Time + Diet*Time, data = chicks.training)
+
+chicks.lm.fit.interact
+tidy(chicks.lm.fit.interact)
+```
+
+### Linear mixed effect model
+
+This really should be a linear mixed-effect model so see if you can do that instead (e.g. with lme4 or stan at the engine)
+
+```{r}
+lmer.model <- 
+  linear_reg() %>% 
+  set_engine("lmer")
+
+chicks.lmer.fit <- 
+  lmer.model %>% 
+  fit(weight ~ Diet + Time + (1|Chick), data = chicks.training)
+
+chicks.lmer.fit
+```
+
+```{r}
+chicks.lmer.fit %>% extract_fit_engine() %>% summary
+```
+
+### Predict Weight 
+Use your model to predict weight in your test set chicks using parsnip tools
+
+```{r}
+chicks.testing.predict = chicks.testing %>%
+  bind_cols(predict(chicks.lm.fit, chicks.testing)) %>% 
+  # Add 95% prediction intervals to the results:
+  bind_cols(predict(chicks.lm.fit, chicks.testing, type = "pred_int"))
+summary(chicks.testing.predict)
+```
+# predictions are the same for chicks with the same diet?
+
+```{r}
+chicks.testing.predict.2 = chicks.testing %>%
+  bind_cols(predict(chicks.lm.fit.interact, chicks.testing)) %>% 
+  # Add 95% prediction intervals to the results:
+  bind_cols(predict(chicks.lm.fit, chicks.testing, type = "pred_int"))
+summary(chicks.testing.predict.2)
+```
+
+### Plot predicted versus observed in your test data set
+
+```{r}
+ggplot(chicks.testing.predict, aes(x = weight, y = .pred, color = Diet)) +
+  geom_point()
+```
+
+```{r}
+ggplot(chicks.testing.predict.2, aes(x = weight, y = .pred, color = Diet)) +
+  geom_point()
+```
+
+
