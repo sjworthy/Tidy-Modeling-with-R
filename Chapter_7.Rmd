@@ -1,0 +1,281 @@
+---
+title: "Chapter_7"
+author: "Sam Worthy"
+date: "2023-12-10"
+output: html_notebook
+---
+
+# A Model Workflow
+
+The purpose of the model workflow concept and the corresponding tidymodels workflow() is to encapsulate the major pieces of the modeling process. Importance of workflow:
+
+1. encourages good methodology since it is a single point of engry to the estimatation components of a data analysis.
+2. enables the user to better organize projects
+
+### 7.1 Where does the model begin and end?
+
+The conventional way of thinking about the modeling process is that it only includes the model fit.
+
+A variety of choices and additional steps often occur before the model is fit:
+
+1. It is common to start with more than p candidate predictors and through exploratory data analysis or using domain knowledge, some of the predictors may be excluded. 
+2. There are times when the value of a predictor is missing and can be imputed using other values in the data.
+3. It may be beneficial to transform the scale of a predictor
+
+The broader modeling process includes any preprocessing steps, the model fit itself, as well as potential post-processing activities, aka the model workflow. 
+
+The workflow must include all significant estimation steps. An example with principal component analysis (PCA) signal extraction. PCA is a way to replace correlated predictors with new artificial features that are uncorrelated and capture most of the information in the original set. The new features could be used as the predictors, and least squares regression could be used to estimate the model parameters. 
+
+Two ways of thinking about model workflow.
+
+1. INCORRECT METHOD: to think of the PCA preprocessing step, as NOT being part of the modeling workflow
+2. PCA preporcessing is considered part of the modeling workflow. The fallacy is there PCA is assumed to have no uncertainty associted with it. The PCA components are treated as known, and if not included in the model workflow, the effect of PCA could not be adequately measured. 
+
+#### 7.2 Workflow basics
+
+Workflows package allows the user to bind modeling and preprocessing objects together.
+
+```{r}
+data(ames)
+ames <- mutate(ames, Sale_Price = log10(Sale_Price))
+
+set.seed(502)
+ames_split <- initial_split(ames, prop = 0.80, strata = Sale_Price)
+ames_train <- training(ames_split)
+ames_test  <-  testing(ames_split)
+```
+
+
+```{r}
+library(tidymodels)  # Includes the workflows package
+tidymodels_prefer()
+
+lm_model <- 
+  linear_reg() %>% 
+  set_engine("lm")
+```
+
+A workflow always requires a parsnip model object
+```{r}
+lm_wflow <- 
+  workflow() %>% 
+  add_model(lm_model)
+
+lm_wflow
+```
+If our model is very simple, a standard R formula can be used as the preprocessor:
+
+```{r}
+lm_wflow <- 
+  lm_wflow %>% 
+  add_formula(Sale_Price ~ Longitude + Latitude)
+
+lm_wflow
+```
+Workflows have a fit() method that can be used to create the model.
+
+```{r}
+lm_fit <- fit(lm_wflow, ames_train)
+lm_fit
+```
+
+We can also predict() on the fitted workflow.
+
+```{r}
+predict(lm_fit, ames_test %>% slice(1:3))
+
+```
+Both the model and preprocessor can be removed or updated.
+
+```{r}
+lm_fit %>% update_formula(Sale_Price ~ Longitude)
+```
+### 7.3 adding raw variables to the workflow()
+
+There is another interface for passing data to the model, the add_variables() function, which uses a dplyr-like syntax for choosing variables. The function has two primary arguments: outcomes and predictors. These use a selection approach similar to the tidyselect backend of tidyverse packages to capture multiple selectors using c().
+
+```{r}
+lm_wflow <- 
+  lm_wflow %>% 
+  remove_formula() %>% 
+  add_variables(outcome = Sale_Price, predictors = c(Longitude, Latitude))
+lm_wflow
+```
+The predictors could also have been specified using a more general selector. Note, must be used within a selection function like above. 
+
+```{r}
+predictors = c(ends_with("tude"))
+```
+
+One nicety is that any outcome columns accidentally specificed in the predictors argument will be quietly removed. This facilitates the use of:
+
+```{r}
+predictors = everything()
+```
+
+When the model is fit, the specification assembles these data, unaltered, into a dataframe and passes it to the underlying function.
+
+```{r}
+fit(lm_wflow, ames_train)
+```
+add_variables() facilitates more complex modeling specifications. However, models such as glmnet and xgboost expect the user to make indicator variables from factor predictors. 
+
+### 7.4 How does a workflow() use the formula?
+The formula method in R has multiple purposes one of which is to properly encode the original data into an analysis-ready format. This can invovle executing inline transformations (e.g. log(x)), creating dummy variable columns, creating interactions or other column expansions, and so on. However, many statistical mehtods require different types of encodings:
+
+* most packages for tree-based models use the formula interface but do not encode the categorical predictors as dummy variables.
+* packages can use special inline funcitons taht tell the model function how to treat the predictor in the analysis. For example, in survival analysis models, a formula term such as strate(site) would indicate that the column site is a stratification variable. This means it should not be treated as a regular predictor and does not have a corresponding location parameter estimate in the model.
+* A few R packages have extended the formula in ways that base R functions cannot parse or execute. In multilevel models, a model term such as (week|subject) indicates that the colun week is a random effect that has different slope parameter estimates for each value of the subject column. 
+
+A workflow is a general purpose interface. 
+
+#### Tree-based models
+
+When we fit a tree to the data, the parsnip package understands what the modeling function would do. For example, if a random forest model is fit using the ranger or randomForest packages, the workflow knows predictors columns that are factors shoudl be left as is.
+
+As a counterexample, a boosted tree created with the xgboost package requires the user to create dummy variables from factor predictors. This requirement is embedded into the model specification object and a workflow using xgboost will create the indicator columns for this engine. 
+
+#### 7.4.1 Special formulas and inline functions
+
+A number of multilevel models have standardized on a formula specification devided in the lme4 package. For example to fit a regression model that has random effects for subjects, we would use the following formula:
+
+```{r}
+library(lme4)
+library(nlme)
+lmer(distance ~ Sex + (age | Subject), data = Orthodont)
+```
+
+The effect of this is that each subject will have an estimated intercept and slope parameter for age. The problem is that standard R methods can't properly process this formula. The issue is that the special formula has to be processed by the underlying package code, not the standard model.matrix approach.
+
+```{r}
+model.matrix(distance ~ Sex + (age | Subject), data = Orthodont)
+```
+The solution in workflows is an optional supplementary model formula that can be passed to add_model(). The add_variable() specification provides the bare column names, and then the actual formula given to the model is set within add_model().
+
+```{r}
+library(multilevelmod)
+
+multilevel_spec <- linear_reg() %>% set_engine("lmer")
+
+multilevel_workflow <- 
+  workflow() %>% 
+  # Pass the data along as-is: 
+  add_variables(outcome = distance, predictors = c(Sex, age, Subject)) %>% 
+  add_model(multilevel_spec, 
+            # This formula is given to the model
+            formula = distance ~ Sex + (age | Subject))
+
+multilevel_fit <- fit(multilevel_workflow, data = Orthodont)
+multilevel_fit
+```
+We can even use the previously mentioned strata() function from the survival package for survival analysis.
+
+```{r}
+library(censored)
+
+parametric_spec <- survival_reg()
+
+parametric_workflow <- 
+  workflow() %>% 
+  add_variables(outcome = c(fustat, futime), predictors = c(age, rx)) %>% 
+  add_model(parametric_spec, 
+            formula = Surv(futime, fustat) ~ age + strata(rx))
+
+parametric_fit <- fit(parametric_workflow, data = ovarian)
+parametric_fit
+```
+
+### 7.5 creating multiple workflows at once
+
+In some situations, the data require numerous attempts to find an appropriate model. For example,
+
+* for predictive models, it is advisable to evaluate a variety of different model types. This requires the user to create multiple model specifications.
+* sequential testing of models typically starts with an expanded set of predictors. This "full model" is compared to a sequence of the same model that removes each predictor in turn. 
+
+It can become tedious or onerous to create a lot of workflows from different sets of preprocessors and/or model specifications. To address this problem, the workflowset package creates combinations of workflow components. A list of preprocessors (e.g. formulas, dplyr selectors, or feature enginerring recipe objects) can be combined with a list of model specifications, resulting in a set of workflows. 
+
+As an example, let's say that we want to focus on the different ways that house location is represented in the Ames data. We can create a set of formulas taht capture these predictors:
+
+```{r}
+location <- list(
+  longitude = Sale_Price ~ Longitude,
+  latitude = Sale_Price ~ Latitude,
+  coords = Sale_Price ~ Longitude + Latitude,
+  neighborhood = Sale_Price ~ Neighborhood
+)
+```
+
+These represntations can be crossed with one or more models using the workflow_set() function. We'll just use the previous linear model specifications to demonstrate:
+
+```{r}
+library(workflowsets)
+location_models <- workflow_set(preproc = location, models = list(lm = lm_model))
+location_models
+```
+
+```{r}
+location_models$info[[1]]
+```
+
+```{r}
+extract_workflow(location_models, id = "coords_lm")
+```
+Workflow sets are mostly designed to work with resampling. The columns option and result must be populated with specific types of objects that result from resampling. Let's create model fits for each formula and save them in a new column called fit. 
+
+```{r}
+location_models <-
+   location_models %>%
+   mutate(fit = map(info, ~ fit(.x$workflow[[1]], ames_train)))
+location_models
+```
+
+```{r}
+location_models$fit[[1]]
+```
+### 7.6 Evaluating the test set
+
+There is a convenience function called last_fit() that will fit the model to the entire training set and evaluate it with the testing set. Using the lm_wflow as an example, we can pass the model and the initial training/testing split to the function. Notice that last_fit() takes a data split as an input, not a dataframe. This function uses the split to generate the training and test sets for the final fitting and evaluation.
+
+```{r}
+final_lm_res <- last_fit(lm_wflow, ames_split)
+final_lm_res
+```
+
+The .workflow column contains the fitted workflow and can be pulled otu of the results using:
+
+```{r}
+fitted_lm_wflow <- extract_workflow(final_lm_res)
+```
+
+Similarly, collect_metrics() and collect_predictions() provide access to the performance metrics and predictions, respectively.
+
+```{r}
+collect_metrics(final_lm_res)
+collect_predictions(final_lm_res) %>% slice(1:5)
+```
+
+### 7.7 Chapter Summary
+
+The related code that we'll see used again is:
+
+```{r}
+library(tidymodels)
+data(ames)
+
+ames <- mutate(ames, Sale_Price = log10(Sale_Price))
+
+set.seed(502)
+ames_split <- initial_split(ames, prop = 0.80, strata = Sale_Price)
+ames_train <- training(ames_split)
+ames_test  <-  testing(ames_split)
+
+lm_model <- linear_reg() %>% set_engine("lm")
+
+lm_wflow <- 
+  workflow() %>% 
+  add_model(lm_model) %>% 
+  add_variables(outcome = Sale_Price, predictors = c(Longitude, Latitude))
+
+lm_fit <- fit(lm_wflow, ames_train)
+```
+

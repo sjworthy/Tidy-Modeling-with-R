@@ -8,6 +8,7 @@ output: html_notebook
 ```{r}
 library(tidymodels)
 library(multilevelmod)
+library(broom.mixed)
 tidymodels_prefer()
 ```
 
@@ -24,7 +25,7 @@ summary(ChickWeight)
 Each chick only received one diet so need to split by chicks acrosss diets
 
 ```{r}
-chick.split = group_initial_split(ChickWeight,Chick)
+chick.split = group_initial_split(ChickWeight,strata = Diet, Chick)
 chick.split
 ```
 
@@ -79,6 +80,7 @@ chicks.lmer.fit <-
   fit(weight ~ Diet + Time + (1|Chick), data = chicks.training)
 
 chicks.lmer.fit
+tidy(chicks.lmer.fit)
 ```
 
 ```{r}
