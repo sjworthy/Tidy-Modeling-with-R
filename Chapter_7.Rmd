@@ -9,7 +9,7 @@ output: html_notebook
 
 The purpose of the model workflow concept and the corresponding tidymodels workflow() is to encapsulate the major pieces of the modeling process. Importance of workflow:
 
-1. encourages good methodology since it is a single point of engry to the estimatation components of a data analysis.
+1. encourages good methodology since it is a single point of engry to the estimation components of a data analysis.
 2. enables the user to better organize projects
 
 ### 7.1 Where does the model begin and end?
@@ -205,7 +205,7 @@ location <- list(
 )
 ```
 
-These represntations can be crossed with one or more models using the workflow_set() function. We'll just use the previous linear model specifications to demonstrate:
+These representations can be crossed with one or more models using the workflow_set() function. We'll just use the previous linear model specifications to demonstrate:
 
 ```{r}
 library(workflowsets)
