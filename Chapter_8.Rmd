@@ -107,7 +107,7 @@ lm_fit <- fit(lm_wflow, ames_train)
 
 ```
 
-The predict() metho applies the same preprocessing that was used on the training set to the new data before passing them along to the model's predict() method:
+The predict() method applies the same preprocessing that was used on the training set to the new data before passing them along to the model's predict() method:
 
 ```{r}
 predict(lm_fit, ames_test %>% slice(1:3))

@@ -1,0 +1,173 @@
+---
+title: "Exercises_1_8"
+author: "Sam Worthy"
+date: "2024-01-07"
+output:
+  html_document:
+    keep_md: yes
+---
+
+Practice will use Chicago data set on public transit ridership.
+
+```{r}
+library(tidymodels)
+tidymodels_prefer()
+library(modeldata)
+library(ggplot2)
+data("Chicago")
+Chicago
+```
+
+Chicago ridership data contains an abbreviated training set for modeling the number of people (in thousands) who enter the Clark and Lake L station.
+
+## 1 Explore the data
+
+Make a histogram of ridership.
+
+```{r}
+ggplot(data = Chicago, aes(ridership)) +
+  geom_histogram()
+```
+
+What might be causing the two peaks? Is there a predictor variable that can account for this (or that can be used to make a new variable to account for it)?
+
+1. good versus bad weather
+2. when there is not/is a sporting event
+
+## Training and Test
+
+Make an 80/20 train/test split.  Do you need to stratify over anything?
+
+```{r}
+set.seed(010324)
+ride_split = initial_split(Chicago, prop = 0.80)
+ride_train = training(ride_split)
+ride_test = testing(ride_split)
+```
+
+## 3. Workflow Set
+
+Let's compare the effectiveness  of the temp and percip [sic] predictors.
+
+### 3A
+Use a workflow set (see chapter 7) to fit six models, each of which has your predictor from Q1 along with one of the following variables:
+temp_min, temp, temp_max, temp_change, percip, percip_max
+
+```{r}
+lm_model <- 
+  linear_reg() %>% 
+  set_engine("lm")
+```
+
+
+```{r}
+climate = list(
+  temp_min = ridership ~ temp_min + weather_storm,
+  temp = ridership ~ temp + weather_storm,
+  temp_max = ridership ~ temp_max + weather_storm,
+  temp_change = ridership ~ temp_change + weather_storm,
+  precip = ridership ~ percip + weather_storm,
+  precip_max = ridership ~ percip_max + weather_storm
+)
+```
+
+```{r}
+library(workflowsets)
+climate_models = workflow_set(preproc = climate, models = list(lm = lm_model))
+climate_models
+```
+
+```{r}
+climate_models_fit <-
+   climate_models %>%
+   mutate(fit = map(info, ~ fit(.x$workflow[[1]], ride_train)))
+climate_models_fit
+```
+
+### 3B 
+Compare the model fits / predictors (this can be using any of the p-value of the predictor, R2, AIC, log-lik).  Don't worry about the test set, just compare goodness of fit when fit with the training set.
+
+```{r}
+climate_models_compare = 
+climate_models_fit %>%
+  mutate(lm_glance = map(fit, broom::glance),
+    lm_tidy = map(fit, broom::tidy))
+climate_models_compare$lm_glance
+```
+
+Model with temp_min has highest adjusted R-squared, lowest p value, lowest AIC
+
+## 4 Recipes
+### 4A
+Create a workflow recipe that does the following:
+* normalizes all weather and station predictors
+* creates a set of PCs for the weather-related predictors, keeping enough PCs to explain 75% of the variance in the weather variables
+* creates a second set of PCs for the station-related predictors, keeping enough PCs to explaining 75% of the variance in these variables
+
+Hint: tidy(), prep(), and bake() methods for recipes may be helpful in examining what you have done.  The help file on recipe is good too.
+
+Hint2: You can use various dplyr::select functions and regular expressions to avoid having to type out the variable names.  But as a fair-warning, it took me a lot longer to figure that out than it would have to just type then out.  (But next time it might be faster).  I can demo.
+
+```{r}
+ride_recipe = 
+  recipe(ridership ~ ., data = ride_train) %>%
+  step_normalize(Austin,Quincy_Wells,Belmont,Archer_35th,Oak_Park,Western,Clark_Lake,Clinton,Merchandise_Mart,Irving_Park,Washington_Wells,Harlem,Monroe,Polk,Ashland,Kedzie,Addison,Jefferson_Park,Montrose,California,temp_min,temp,temp_max,temp_change,dew,humidity,pressure,pressure_change,wind,wind_max,gust,gust_max,percip,percip_max,weather_rain,weather_snow,weather_cloud,weather_storm) %>%
+  step_pca(temp_min,temp,temp_max,temp_change,dew,humidity,pressure,pressure_change,wind,wind_max,gust,gust_max,percip,percip_max,weather_rain,weather_snow,weather_cloud,weather_storm,threshold = .75, prefix = "weather") %>%
+  step_pca(Austin,Quincy_Wells,Belmont,Archer_35th,Oak_Park,Western,Clark_Lake,Clinton,Merchandise_Mart,Irving_Park,Washington_Wells,Harlem,Monroe,Polk,Ashland,Kedzie,Addison,Jefferson_Park,Montrose,California, threshold = .75, prefix = "station")
+```
+
+Had to add prefix since we have two step_pca so instead of both making PC1, one makes weather_1, and the other makes station_1
+### 4B
+Use the recipe from 4A to fit a linear regression of ridership on the new PCs and all remaining predictors (i.e. those not used in making the PCs).  Use the training data.
+
+```{r}
+lm_model <- 
+  linear_reg() %>% 
+  set_engine("lm")
+```
+
+```{r}
+lm_wflow <- 
+  workflow() %>% 
+  add_model(lm_model) %>%
+  add_recipe(ride_recipe)
+```
+
+```{r}
+lm_fit_recipe = fit(lm_wflow, ride_train)
+lm_fit_recipe
+```
+
+### 4C
+Use the fit from 4B to predict ridership in the test data.  Evaluate the predictions.
+Note sure if use predict or last_fit
+```{r}
+ride_predict = predict(lm_fit_recipe, ride_test)
+```
+
+```{r}
+ride_predict_2 = 
+  bind_cols(ride_predict, ride_test %>% select(ridership)) 
+```
+
+```{r}
+ggplot(ride_predict_2, aes(x = ridership, y = .pred)) +
+  geom_point()+
+  geom_smooth(method = "lm")+
+  labs(y = "predicted ridership", x = "observed ridership")
+```
+
+
+```{r}
+final_lm <- last_fit(lm_wflow, ride_split)
+final_lm
+```
+
+```{r}
+collect_metrics(final_lm)
+```
+
+```{r}
+collect_predictions(final_lm)
+```
+
