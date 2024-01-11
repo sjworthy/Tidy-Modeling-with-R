@@ -40,7 +40,7 @@ Make an 80/20 train/test split.  Do you need to stratify over anything?
 
 ```{r}
 set.seed(010324)
-ride_split = initial_split(Chicago, prop = 0.80)
+ride_split = initial_split(Chicago, prop = 0.80, strata = ridership)
 ride_train = training(ride_split)
 ride_test = testing(ride_split)
 ```
@@ -111,9 +111,11 @@ Hint2: You can use various dplyr::select functions and regular expressions to av
 ```{r}
 ride_recipe = 
   recipe(ridership ~ ., data = ride_train) %>%
-  step_normalize(Austin,Quincy_Wells,Belmont,Archer_35th,Oak_Park,Western,Clark_Lake,Clinton,Merchandise_Mart,Irving_Park,Washington_Wells,Harlem,Monroe,Polk,Ashland,Kedzie,Addison,Jefferson_Park,Montrose,California,temp_min,temp,temp_max,temp_change,dew,humidity,pressure,pressure_change,wind,wind_max,gust,gust_max,percip,percip_max,weather_rain,weather_snow,weather_cloud,weather_storm) %>%
-  step_pca(temp_min,temp,temp_max,temp_change,dew,humidity,pressure,pressure_change,wind,wind_max,gust,gust_max,percip,percip_max,weather_rain,weather_snow,weather_cloud,weather_storm,threshold = .75, prefix = "weather") %>%
-  step_pca(Austin,Quincy_Wells,Belmont,Archer_35th,Oak_Park,Western,Clark_Lake,Clinton,Merchandise_Mart,Irving_Park,Washington_Wells,Harlem,Monroe,Polk,Ashland,Kedzie,Addison,Jefferson_Park,Montrose,California, threshold = .75, prefix = "station")
+  update_role(date, new_role = "date") %>%
+  step_normalize(Austin:weather_storm) %>%
+  step_pca(temp_min:weather_storm,threshold = .75, prefix = "weather") %>%
+  step_pca(Austin:California, threshold = .75, prefix = "station")
+ride_recipe
 ```
 
 Had to add prefix since we have two step_pca so instead of both making PC1, one makes weather_1, and the other makes station_1
