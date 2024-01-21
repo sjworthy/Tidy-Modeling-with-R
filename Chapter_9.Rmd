@@ -1,0 +1,302 @@
+---
+title: "Chapter_9"
+author: "Sam Worthy"
+date: "2024-01-21"
+output:
+  html_document:
+    keep_md: yes
+---
+
+Code from previous chapters
+
+```{r}
+library(tidymodels)
+data(ames)
+ames <- mutate(ames, Sale_Price = log10(Sale_Price))
+
+set.seed(502)
+ames_split <- initial_split(ames, prop = 0.80, strata = Sale_Price)
+ames_train <- training(ames_split)
+ames_test  <-  testing(ames_split)
+
+ames_rec <- 
+  recipe(Sale_Price ~ Neighborhood + Gr_Liv_Area + Year_Built + Bldg_Type + 
+           Latitude + Longitude, data = ames_train) %>%
+  step_log(Gr_Liv_Area, base = 10) %>% 
+  step_other(Neighborhood, threshold = 0.01) %>% 
+  step_dummy(all_nominal_predictors()) %>% 
+  step_interact( ~ Gr_Liv_Area:starts_with("Bldg_Type_") ) %>% 
+  step_ns(Latitude, Longitude, deg_free = 20)
+  
+lm_model <- linear_reg() %>% set_engine("lm")
+
+lm_wflow <- 
+  workflow() %>% 
+  add_model(lm_model) %>% 
+  add_recipe(ames_rec)
+
+lm_fit <- fit(lm_wflow, ames_train)
+```
+## Judging Model Effectiveness
+
+Focus of tidymodels is on empirical validation; this usually means using data that were not used to create the model as the substrate to measure effectiveness.
+
+Best approach to empirical validation involves using resampling methods that will be introduced in Chapter 10.
+
+Two common metrics for regression models:
+1. root mean square error (RMSE) - measures accuracy
+2. coefficient of determination (R-squared) - measures correlation
+
+A models optimized for RMSE has more variability but relatively uniform accuracy across the range of the outcome. R-squared optimization has tighter correlation between observed and predicted values but model performs poorly in the tails.
+
+Chapter focus is the yardstick package: a core tidymodels package with the focus of measuring model performance. 
+
+### 9.1 Performance metrics and inference
+
+The effectiveness of any given model depends on how the model will be used. 
+
+* An inferential model is used primarily to understand relationships, and typically emphasizes the choice (and validity) of probabilistic distributions and other generative qualities that define the model.
+* For a prediction model, predictive strength is of primary importance and other concerns about underlying statistical qualities may be less important. Predictive strength usually determined by how close our predictions come to the observed data. 
+
+Advice: for those developing inferential models, use these techniques even when the model will not be used with the primary goal of prediction.
+
+### 9.2 Regression Metrics
+
+Functions in yardstick package are data frame-based with the general syntax of:
+
+```{r, eval = FALSE}
+function(data, truth, ...)
+```
+
+data is a data frame or tibble and truth is the column with the observed outcome values. 
+
+Illustration from Section 8.8.
+Model lm_wflow_fit combines a linear regression model with a predictor set supplemented with an interaction and spline functions for longitude and latitude. 
+
+```{r}
+ames_test_res <- predict(lm_fit, new_data = ames_test %>% select(-Sale_Price))
+ames_test_res
+```
+
+The predicted numeric outcome from the regression model is named .pred. Match the predicted values with their corresponding observed outcome values.
+
+```{r}
+ames_test_res <- bind_cols(ames_test_res, ames_test %>% select(Sale_Price))
+ames_test_res
+```
+
+It is best practice to analyze the predictions on the transformed scale even if the predictions are reported using the original units. 
+
+```{r}
+ggplot(ames_test_res, aes(x = Sale_Price, y = .pred)) + 
+  # Create a diagonal line:
+  geom_abline(lty = 2) + 
+  geom_point(alpha = 0.5) + 
+  labs(y = "Predicted Sale Price (log10)", x = "Sale Price (log10)") +
+  # Scale and size the x- and y-axis uniformly:
+  coord_obs_pred()
+```
+
+Compute RMSE:
+
+```{r}
+rmse(ames_test_res, truth = Sale_Price, estimate = .pred)
+```
+
+This shows the standard format of the output of yardstick functions. Metrics for numeric outcomes usually have a value of "standard" for the .estimator column. 
+
+To compute multiple metrics at once, can create a metric set. mae is mean absolute error.
+
+```{r}
+ames_metrics <- metric_set(rmse, rsq, mae)
+ames_metrics(ames_test_res, truth = Sale_Price, estimate = .pred)
+```
+
+The yardstick package does NOT contain a function for adjusted R-squared. This modification of the coefficient of determination is commonly used when the same data used to fit the model are used to evaluate the model. 
+
+### 9.3 Binary Classification Metrics
+
+The modeldata package contains example predictions from a test data set with two classes, Class1 and Class2. The second and third columns are the predicted class probabilities for the test set while predicted are the discrete predictions.
+
+```{r}
+data(two_class_example)
+tibble(two_class_example)
+```
+
+For the hard class predictions, a variety of yardstick functions are helpful:
+
+```{r}
+# A confusion matrix
+conf_mat(two_class_example, truth = truth, estimate = predicted)
+```
+
+```{r}
+# Accuracy
+accuracy(two_class_example, truth, predicted)
+```
+
+```{r}
+# Matthews correlation coefficient:
+mcc(two_class_example, truth, predicted)
+```
+
+```{r}
+# F1 metric:
+f_meas(two_class_example, truth, predicted)
+```
+
+Combining these three classification metrics together
+
+```{r}
+classification_metrics <- metric_set(accuracy, mcc, f_meas)
+classification_metrics(two_class_example, truth = truth, estimate = predicted)
+
+```
+
+The Matthews correlation coefficient and F1 score both summarize the confusion matrix, but compared to mcc(), which measures the quality of both positive and negative examples, the f_meas() metric emphasizes the positive class, i.e. the event of interest. Yardstick functions have a standard argument called event_level to distinguish positive and negative levels. The default is that the first level of the outcome factor is the event of interest.
+
+As an example where the second level is the event:
+
+```{r}
+f_meas(two_class_example, truth, predicted, event_level = "second")
+```
+
+There are numerous classification metrics that use the predicted probabilities as inputs rather than the hard class predictions. For example, the receiver operating characteristic (ROC) curve computes the sensitivity and specificity over a continuum of different event thresholds. The predicted class column is not used. There are two yardstick functions for this method: roc_curve() computes the data points that make up the ROC curve and roc_auc() computes the area under the curve. The ... placeholder is used to pass the appropriate class probability column.
+
+```{r}
+two_class_curve <- roc_curve(two_class_example, truth, Class1)
+two_class_curve
+```
+
+```{r}
+roc_auc(two_class_example, truth, Class1)
+```
+
+The two_class_curve object can be used in ggplot to visualize the curve. There is an autoplot() method that will take care of the details.
+
+```{r}
+autoplot(two_class_curve)
+```
+
+If the curve was close to the diagonal line, then the model's predictions would be no better than random guessing. Since the curve is up in the top, left-hand corner, we see that our model performs well at different thresholds. 
+
+### 9.4 Multiclass Classification Metrics
+
+Considering data with three or more classes.
+
+```{r}
+data(hpc_cv)
+tibble(hpc_cv)
+```
+
+Data set has factors for the observed and predicted outcomes along with four other column of predicted probabilities for each class. 
+
+The functions for metrics that use the discrete class predictions are identical to their binary counterparts.
+
+```{r}
+# accuracy
+accuracy(hpc_cv, obs, pred)
+```
+
+```{r}
+# matthews correlation coefficient
+mcc(hpc_cv, obs, pred)
+```
+
+There are methods for taking metrics designed to handle outcomes with only two classes and extend them for outcomes with more than two classes. For example, there are wrapper methods that can be used to apply sensitivity to our four-class outcome. The options are:
+
+1. macro-averaging computes a set of one-versus-all metrics using the standard two-class statistics. These are averaged.
+2. macro-weighted averaging does the same but the average is weighted by the number of samples in each class.
+3. micro-averaging computes the contribution for each class, aggregates them, then computes a single metric from the aggregates. 
+
+Using sensitivity as an example, the usual two-class calculation is the ratio of the number of correctly predicted events divided by the number of true events. The manual calculations for these averaging methods are:
+
+```{r}
+class_totals <- 
+  count(hpc_cv, obs, name = "totals") %>% 
+  mutate(class_wts = totals / sum(totals))
+class_totals
+```
+
+```{r}
+cell_counts <- 
+  hpc_cv %>% 
+  group_by(obs, pred) %>% 
+  count() %>% 
+  ungroup()
+```
+
+
+```{r}
+# Compute the four sensitivities using 1-vs-all
+one_versus_all <- 
+  cell_counts %>% 
+  filter(obs == pred) %>% 
+  full_join(class_totals, by = "obs") %>% 
+  mutate(sens = n / totals)
+one_versus_all
+```
+
+```{r}
+# Three different estimates:
+one_versus_all %>% 
+  summarize(
+    macro = mean(sens), 
+    macro_wts = weighted.mean(sens, class_wts),
+    micro = sum(n) / sum(totals)
+  )
+```
+
+Yardstick functions can automatically apply these methods via the estimator argument:
+
+```{r}
+sensitivity(hpc_cv, obs, pred, estimator = "macro")
+```
+
+```{r}
+sensitivity(hpc_cv, obs, pred, estimator = "macro_weighted")
+```
+
+```{r}
+sensitivity(hpc_cv, obs, pred, estimator = "micro")
+```
+
+When dealing with probability estimates, there are some metrics with multiclass analogs. Multiclass technique for ROC curves, all of the class probability columns must be given to the function.
+
+```{r}
+roc_auc(hpc_cv, obs, VF, F, M, L)
+```
+
+Macro-weighted averaging is also available as an option for applyign this metric to a multiclass outcome:
+
+```{r}
+roc_auc(hpc_cv, obs, VF, F, M, L, estimator = "macro_weighted")
+```
+
+All of these performance metrics can be computed using dplyr groupings. Recall that these data have a column for the resampling groups. Notice how we can pass a grouped data frame to the metric function to compute the metrics for each group.
+
+```{r}
+hpc_cv %>% 
+  group_by(Resample) %>% 
+  accuracy(obs, pred)
+```
+
+The groupings also translate to the autoplot() methods.
+
+```{r}
+# Four 1-vs-all ROC curves for each fold
+hpc_cv %>% 
+  group_by(Resample) %>% 
+  roc_curve(obs, VF, F, M, L) %>% 
+  autoplot
+```
+
+This visualization shows us that the different groups all perform about the same, but that the VF class is predicted better than the F or M classes, since VF ROC curves are more in the top-left corner. 
+
+### Chapter Summary
+
+1. Different metrics measure different aspects of a model fit.
+2. Measuring model performance is important even when a given model will be not used primarily for prediction.
+3. Functions from the yardstick package measure the effectiveness of a model using data.
+4. The primary tidymodels interface uses tidyverse principles and data frames. 
+5. Different metrics are appropriate for regression and classification metrics and, within these, there are sometimes different ways to estimate the statistics, such as for multiclass outcomes.
