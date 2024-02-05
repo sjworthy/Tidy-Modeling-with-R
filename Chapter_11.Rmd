@@ -52,7 +52,7 @@ lm_models <- workflow_set(preproc, list(lm = linear_reg()), cross = FALSE)
 lm_models
 ```
 
-Resample each of these models in turn. Use a purrr-like functon called workflow_map(). This function takes an initial argument of the function apply to the workflows, followed by options to that function. 
+Resample each of these models in turn. Use a purrr-like function called workflow_map(). This function takes an initial argument of the function apply to the workflows, followed by options to that function. 
 
 ```{r}
 set.seed(1001)
