@@ -1,0 +1,263 @@
+---
+title: "Exercise_02-12-24"
+author: "Sam Worthy"
+date: "2024-02-11"
+output:
+  html_document:
+    keep_md: yes
+---
+
+```{r}
+library(tidymodels)
+tidymodels_prefer()
+library(modeldata)
+library(ggplot2)
+library(workflowsets)
+library(ggrepel)
+library(tidyposterior)
+library(rstanarm)
+```
+
+```{r}
+data("Chicago")
+Chicago
+```
+
+set up the weekend variable:
+```{r}
+Chicago <- Chicago %>%
+  mutate(weekend = timeDate::isBizday(timeDate::as.timeDate(date)))
+```
+
+
+## Training and Test
+
+Make an 80/20 train/test split.  Strata with ridership
+
+```{r}
+set.seed(010324)
+ride_split = initial_split(Chicago, prop = 0.80, strata = ridership)
+ride_train = training(ride_split)
+ride_test = testing(ride_split)
+```
+
+## 3. Workflow Set
+
+```{r}
+lm_model <- 
+  linear_reg() %>% 
+  set_engine("lm")
+```
+
+```{r}
+climate = list(
+  temp_min = ridership ~ temp_min + weather_storm,
+  temp = ridership ~ temp + weather_storm,
+  temp_max = ridership ~ temp_max + weather_storm,
+  temp_change = ridership ~ temp_change + weather_storm,
+  precip = ridership ~ percip + weather_storm,
+  precip_max = ridership ~ percip_max + weather_storm)
+```
+
+```{r}
+climate_models = workflow_set(preproc = climate, models = list(lm = lm_model))
+climate_models
+```
+
+```{r}
+climate_models_fit <-
+   climate_models %>%
+   mutate(fit = map(info, ~ fit(.x$workflow[[1]], ride_train)))
+climate_models_fit
+```
+
+## 4 Recipes
+
+```{r}
+ride_recipe = 
+  recipe(ridership ~ ., data = ride_train) %>%
+  update_role(date, new_role = "date") %>%
+  step_normalize(Austin:weather_storm) %>%
+  step_pca(temp_min:weather_storm,threshold = .75, prefix = "weather") %>%
+  step_pca(Austin:California, threshold = .75, prefix = "station")
+ride_recipe
+```
+
+### 4B
+Use the recipe from 4A to fit a linear regression of ridership on the new PCs and all remaining predictors (i.e. those not used in making the PCs).  Use the training data.
+
+```{r}
+lm_wflow <- 
+  workflow() %>% 
+  add_model(lm_model) %>%
+  add_recipe(ride_recipe)
+```
+
+```{r}
+lm_fit_recipe = fit(lm_wflow, ride_train)
+lm_fit_recipe
+```
+
+## New Exercise Material
+
+Use Cross-fold validation and the model selection techniques shown in chapter 12 to compare models with:
+
+1. All PCs and remaining predictors (same as Q4)
+2. The PCs + the weekend variable (no sports team data)
+3. 1 weather PC, 1 station PC, + the weekend variable
+4. 1 weather PC + the weekend variable
+5. 1 station PC + the weekend variable
+6. the weekend variable only
+
+New simple recipe
+
+```{r}
+ride_recipe = 
+  recipe(ridership ~ ., data = ride_train) %>%
+  update_role(date, new_role = "date") %>%
+  update_role(Austin:California, new_role = "station") %>%
+  update_role(temp_min:weather_storm, new_role = "weather") %>%
+  update_role(Blackhawks_Away:Cubs_Home, new_role = "sports") %>%
+  step_normalize(has_role("station"), has_role("weather"))
+ride_recipe
+```
+
+adding new small recipes based on models
+
+```{r}
+# Build each recipe
+rec_1 <- ride_recipe %>%
+  step_pca(has_role("station"), threshold = .75, prefix = "station_PC", id = "station_pca") %>%
+  step_pca(has_role("weather"), threshold = .75, prefix = "weather_PC", id = "weather_pca") %>%
+  update_role(has_role("sports"), new_role = "predictor")
+
+rec_2 <- ride_recipe %>%
+  step_pca(has_role("station"), threshold = .75, prefix = "station_PC", id = "station_pca") %>%
+  step_pca(has_role("weather"), threshold = .75, prefix = "weather_PC", id = "weather_pca")
+
+rec_3 <- ride_recipe %>%
+  step_pca(has_role("station"), num_comp = 1, prefix = "station_PC", id = "station_pca") %>%
+  step_pca(has_role("weather"), num_comp = 1, prefix = "weather_PC", id = "weather_pca")
+  
+rec_4 <- ride_recipe %>%
+  step_pca(has_role("weather"), num_comp = 1, prefix = "weather_PC", id = "weather_pca")
+
+rec_5 <- ride_recipe %>%
+  step_pca(has_role("station"), num_comp = 1, prefix = "station_PC", id = "station_pca")
+
+rec_6 <- ride_recipe
+
+preproc <- list(
+  one = rec_1,
+  two = rec_2,
+  three = rec_3,
+  four = rec_4,
+  five = rec_5,
+  six = rec_6
+)
+```
+
+
+```{r}
+lm_models <- workflow_set(preproc, list(lm = linear_reg()), cross = FALSE)
+lm_models
+```
+
+Get folds
+
+```{r}
+chicago_folds <- vfold_cv(ride_train, v = 10)
+chicago_folds
+```
+```{r}
+keep_pred <- control_resamples(save_pred = TRUE, save_workflow = TRUE)
+```
+
+
+```{r}
+lm_models <- 
+  lm_models %>% 
+  workflow_map("fit_resamples", 
+               seed = 1101, verbose = TRUE,
+               # Options to `fit_resamples()`: 
+               resamples = chicago_folds, control = keep_pred)
+```
+
+```{r}
+lm_models
+```
+
+```{r}
+collect_metrics(lm_models) %>% 
+  filter(.metric == "rmse")
+```
+
+```{r}
+autoplot(lm_models, metric = "rsq") +
+  geom_text_repel(aes(label = wflow_id), nudge_x = 1/8, nudge_y = 1/100) +
+  theme(legend.position = "none")
+```
+
+```{r}
+rsq_indiv_estimates <- 
+  collect_metrics(lm_models, summarize = FALSE) %>% 
+  filter(.metric == "rsq") 
+
+rsq_wider <- 
+  rsq_indiv_estimates %>% 
+  select(wflow_id, .estimate, id) %>% 
+  pivot_wider(id_cols = "id", names_from = "wflow_id", values_from = ".estimate")
+
+corrr::correlate(rsq_wider %>% select(-id), quiet = TRUE)
+```
+
+```{r}
+rsq_indiv_estimates %>% 
+  mutate(wflow_id = reorder(wflow_id, .estimate)) %>% 
+  ggplot(aes(x = wflow_id, y = .estimate, group = id, color = id)) + 
+  geom_line(alpha = .5, linewidth = 1.25) + 
+  theme(legend.position = "none")
+```
+
+```{r}
+rsq_anova <-
+  perf_mod(
+    lm_models,
+    metric = "rsq",
+    prior_intercept = rstanarm::student_t(df = 1),
+    chains = 4,
+    iter = 5000,
+    seed = 1102
+  )
+```
+
+```{r}
+model_post <- 
+  rsq_anova %>% 
+  # Take a random sample from the posterior distribution
+  # so set the seed again to be reproducible. 
+  tidy(seed = 1103) 
+
+glimpse(model_post)
+```
+
+```{r}
+model_post %>% 
+  mutate(model = forcats::fct_inorder(model)) %>%
+  ggplot(aes(x = posterior)) + 
+  geom_histogram(bins = 50, color = "white", fill = "blue", alpha = 0.4) + 
+  facet_wrap(~ model, ncol = 1)
+```
+
+```{r}
+autoplot(rsq_anova) +
+  geom_text_repel(aes(label = workflow), nudge_x = 1/8, nudge_y = 1/100) +
+  theme(legend.position = "none")
+```
+
+```{r}
+autoplot(rsq_anova, type = "ROPE", size = 0.02) +
+  geom_text_repel(aes(label = workflow)) +
+  theme(legend.position = "none")
+```
+
