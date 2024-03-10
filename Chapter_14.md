@@ -1,0 +1,19156 @@
+---
+title: "Chapter_14"
+author: "Sam Worthy"
+date: "2024-03-10"
+output: 
+  html_document: 
+    keep_md: yes
+---
+
+## Chapter 14 Iterative Search
+
+Grid search takes a pre-defined set of candidate values, evaluates them, then chooses the best settings. Iterative search predicts which values to test next.
+
+Two search methods:
+
+1. Bayesian optimization which uses a statistical model to predict better parameter settings
+2. Simulated annealing
+
+Previous chapter code:
+
+
+```r
+library(tidymodels)
+```
+
+```
+## ── Attaching packages ────────────────────────────────────── tidymodels 1.1.1 ──
+```
+
+```
+## ✔ broom        1.0.5     ✔ recipes      1.0.8
+## ✔ dials        1.2.0     ✔ rsample      1.2.0
+## ✔ dplyr        1.1.3     ✔ tibble       3.2.1
+## ✔ ggplot2      3.4.4     ✔ tidyr        1.3.0
+## ✔ infer        1.0.5     ✔ tune         1.1.2
+## ✔ modeldata    1.2.0     ✔ workflows    1.1.3
+## ✔ parsnip      1.1.1     ✔ workflowsets 1.0.1
+## ✔ purrr        1.0.2     ✔ yardstick    1.2.0
+```
+
+```
+## ── Conflicts ───────────────────────────────────────── tidymodels_conflicts() ──
+## ✖ purrr::discard() masks scales::discard()
+## ✖ dplyr::filter()  masks stats::filter()
+## ✖ dplyr::lag()     masks stats::lag()
+## ✖ recipes::step()  masks stats::step()
+## • Dig deeper into tidy modeling with R at https://www.tmwr.org
+```
+
+```r
+data(cells)
+cells <- cells %>% select(-case)
+
+set.seed(1304)
+cell_folds <- vfold_cv(cells)
+
+roc_res <- metric_set(roc_auc)
+```
+
+
+### 14.1 A support vector machine model
+
+The two tuning parameters to optimize are the SVM cost value and the radial basis function kernel parameter, sigma. The SVM model uses a dot product and for this reason it is necessary to center and scale the predictors. 
+
+
+```r
+library(tidymodels)
+tidymodels_prefer()
+
+svm_rec <- 
+  recipe(class ~ ., data = cells) %>%
+  step_YeoJohnson(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+svm_spec <- 
+  svm_rbf(cost = tune(), rbf_sigma = tune()) %>% 
+  set_engine("kernlab") %>% 
+  set_mode("classification")
+
+svm_wflow <- 
+  workflow() %>% 
+  add_model(svm_spec) %>% 
+  add_recipe(svm_rec)
+```
+
+The defaul parameter ranges for the two tuning parameters cost and rbf_sigma are:
+
+
+```r
+cost()
+```
+
+```
+## Cost (quantitative)
+## Transformer: log-2 [1e-100, Inf]
+## Range (transformed scale): [-10, 5]
+```
+
+```r
+rbf_sigma()
+```
+
+```
+## Radial Basis Function sigma (quantitative)
+## Transformer: log-10 [1e-100, Inf]
+## Range (transformed scale): [-10, 0]
+```
+
+For illustration, let's slightly change the kernel parameter range, to improve the visualization of the search:
+
+
+```r
+svm_param <- 
+  svm_wflow %>% 
+  extract_parameter_set_dials() %>% 
+  update(rbf_sigma = rbf_sigma(c(-7, -1)))
+```
+
+The following search procedures require at least some resampled performance statistics before proceeding. For this purpose, the following code creates a small regular grid that resides in the flat portion of the parameter space. The tune_grid() function resamples this grid:
+
+
+```r
+set.seed(1401)
+start_grid <- 
+  svm_param %>% 
+  update(
+    cost = cost(c(-6, 1)),
+    rbf_sigma = rbf_sigma(c(-6, -4))
+  ) %>% 
+  grid_regular(levels = 2)
+
+set.seed(1402)
+svm_initial <- 
+  svm_wflow %>% 
+  tune_grid(resamples = cell_folds, grid = start_grid, metrics = roc_res)
+
+collect_metrics(svm_initial)
+```
+
+```
+## # A tibble: 4 × 8
+##     cost rbf_sigma .metric .estimator  mean     n std_err .config             
+##    <dbl>     <dbl> <chr>   <chr>      <dbl> <int>   <dbl> <chr>               
+## 1 0.0156  0.000001 roc_auc binary     0.864    10 0.00864 Preprocessor1_Model1
+## 2 2       0.000001 roc_auc binary     0.863    10 0.00867 Preprocessor1_Model2
+## 3 0.0156  0.0001   roc_auc binary     0.863    10 0.00862 Preprocessor1_Model3
+## 4 2       0.0001   roc_auc binary     0.866    10 0.00855 Preprocessor1_Model4
+```
+
+This initial grid shows fairly equivalent results, with no individual point much better than any of the others. 
+
+### 14.2 Bayesian optimization
+
+Bayesian optimization techniques analyze the current resampling results and create a predictive model to suggest tuning parameter values that have yet to be evaluated. The suggested parameter combination is then resampled. These results are then used in another predictive model that recommends more candidate values for testing, and so on. The process proceeds for a set number of iterations or until no further improvements occur.
+
+When using Bayesian optimization, the primary concerns are how to create the model and how to select parameters recommended by that model. First, let's consider the technique most commonly used for Bayesian optimization, the Gaussian process model.
+
+#### 14.2.1 A Gaussian process model
+
+Gaussian process (GP) models are well known statistical techniques that have a history in spatial statistics (kriging methods). They can be derived in multiple ways, including as a Bayesian model.
+
+Mathematically, a GP is a collection of random variables whose joint probability distribution is multivariate Gaussian. In the context of our application, this is the collection of performance metrics for the tuning parameter candidate values. For the previous initial grid of four samples, the realization of these four random variables were 0.8639, 0.8625, 0.8627, and 0.8659. These are assumed to be distributed as multivariate Gaussian. The inputs that define the independent variables/predictors for the GP model are the corresponding tuning parameter values. 
+
+Gaussian process models are specificed by their mean and covariance functions, although the latter has the most effect on the nature of the GP model. The covariance function is often parameterized in terms of the input values (denoted as x). A commonly used covariance function is the squared exponential function. This equation translates to: As the distance between two tuning parameter combinations increases, the covariance between the performance metrics increase exponentially. The nature of the equation also implies that the variation of the outcome metric is minimized at the points that have already been observed. 
+
+The nature of this covariance function allows the Gaussian process to represent highly nonlinear relationships between model performance and the tuning parameters even when only a small amount of data exists. 
+
+An important virtue of this model is that, since a full probability model is specified, the predictions for new inputs can reflect the entire distribution of the outcome. In other words, new performance statistics can be predicted in terms of both mean and variance. 
+
+Suppose that two new tuning parameters were under consideration. Candidate A has a slightly better mean ROC value than candidate B. However, its variance is four fold larger than B. Choosing option A is riskier but has potentially higher return. The increase in variance also reflects that this new value is farther from the existing data than B. 
+
+#### 14.2.2 Acquisition Functions
+
+Once the GP is fit to the current data, how is it used? Our goal is to choose the next tuning parameter combination that is most likely to have "better results" than the current best. One approach to do this is to create a large candidate set (perhaps using a space-filling design) and then make mean and variance predictions on each. Using this information, we choose the most advantageous tuning parameter value.
+
+A class of object functions, called acquisition functions, facilitate the trade-off between mean and variance. Recall that the predicted variance of the GP models are mostly driven by how far away they are from the existing data. The trade-off between the predicted mean and variance for new candidates is frequently viewed through the lens of exploration and exploitation:
+
+* Exploration biases the selection towards regions where there are fewer (if any) observed candidate models. This tends to give more weight to candidates with higher variance and focuses on finding new results.
+* Exploitation principally relies on the mean prediction to find the best (mean) value. It focuses on existing results. 
+
+From a pure exploitation standpoint, the best choice would select the parameter value that has the best mean prediction. 
+
+As a way to encourage exploration, a simple (but not often used) approach is to find the tuning parameter associated with the largest confidence interval. Increasing the nubmer of standard deviations used in the upper bound would push the selection farther into empty regions. 
+
+One of the most commonly used acquisition functions is expected improvement. The notion of improvement requires a value for the current best results (unlike the confidence bound approach). Since the GP can describe a new candidate point using a distribution, we can weight the parts of the distribution that show improvement using the probability of the improvement occurring. 
+
+In tidymodels, expected improvement is the default acquisition function.
+
+#### 14.2.3 The tune_bayes() function
+
+To implement interative search via Bayesian optimization, use the tune_bayes() function. Its syntax is very similar to tune_grid() but with several additional arguments.
+
+* iter: is the maximum number of search iterations
+* initial: can be either an integer, an object produced using tune_grid(), or one of the racing function. Using an integer specifies the size of a space-filling design that is sampled prior to the first GP model.
+* objective: is an argument for which acquisition function should be used. The tune package contains functions to pass here, such as exp_improve() or conf_bound().
+* The param info: argument, in this case, specifies the range of the parameters as well as any transformations that are used. These are used to define the search space. In situations where the default parameter objects are insufficient, param_info is used to override the defaults.
+* the control: argument now used the results of control_bayes(). Some helpful arguments include:
+  + no_improve: is an integer that will stop the search if improved parameters are not discovered within no_improve iterations
+  + uncertain: is also an integer (or Inf) that will take an uncertainty sample if there is no improvement within uncertain iterations. This will select the next candidate that has large variation. It has the effect of pure exploration since it does not consider the mean prediction.
+    + verbose is a logical that will print logging information as the search proceeds.
+    
+Let's use the first SVM results as the initial substrate for the GP model. Recall that, for this applicaiton, we want to maximize the area under the ROC curve.
+
+
+```r
+ctrl <- control_bayes(verbose = TRUE)
+
+set.seed(1403)
+svm_bo <-
+  svm_wflow %>%
+  tune_bayes(
+    resamples = cell_folds,
+    metrics = roc_res,
+    initial = svm_initial,
+    param_info = svm_param,
+    iter = 25,
+    control = ctrl
+  )
+```
+
+```
+## i Gaussian process model
+```
+
+```
+## ✓ Gaussian process model
+```
+
+```
+## i Generating 5000 candidates
+```
+
+```
+## i Predicted candidates
+```
+
+```
+## i Estimating performance
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## ✓ Estimating performance
+```
+
+```
+## i Gaussian process model
+```
+
+```
+## ✓ Gaussian process model
+```
+
+```
+## i Generating 5000 candidates
+```
+
+```
+## i Predicted candidates
+```
+
+```
+## i Estimating performance
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## ✓ Estimating performance
+```
+
+```
+## i Gaussian process model
+```
+
+```
+## ✓ Gaussian process model
+```
+
+```
+## i Generating 5000 candidates
+```
+
+```
+## i Predicted candidates
+```
+
+```
+## i Estimating performance
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## ✓ Estimating performance
+```
+
+```
+## i Gaussian process model
+```
+
+```
+## ✓ Gaussian process model
+```
+
+```
+## i Generating 5000 candidates
+```
+
+```
+## i Predicted candidates
+```
+
+```
+## i Estimating performance
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## ✓ Estimating performance
+```
+
+```
+## i Gaussian process model
+```
+
+```
+## ✓ Gaussian process model
+```
+
+```
+## i Generating 5000 candidates
+```
+
+```
+## i Predicted candidates
+```
+
+```
+## i Estimating performance
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## ✓ Estimating performance
+```
+
+```
+## i Gaussian process model
+```
+
+```
+## ✓ Gaussian process model
+```
+
+```
+## i Generating 5000 candidates
+```
+
+```
+## i Predicted candidates
+```
+
+```
+## i Estimating performance
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## ✓ Estimating performance
+```
+
+```
+## i Gaussian process model
+```
+
+```
+## ✓ Gaussian process model
+```
+
+```
+## i Generating 5000 candidates
+```
+
+```
+## i Predicted candidates
+```
+
+```
+## i Estimating performance
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## ✓ Estimating performance
+```
+
+```
+## i Gaussian process model
+```
+
+```
+## ✓ Gaussian process model
+```
+
+```
+## i Generating 5000 candidates
+```
+
+```
+## i Predicted candidates
+```
+
+```
+## i Estimating performance
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## ✓ Estimating performance
+```
+
+```
+## i Gaussian process model
+```
+
+```
+## ✓ Gaussian process model
+```
+
+```
+## i Generating 5000 candidates
+```
+
+```
+## i Predicted candidates
+```
+
+```
+## i Estimating performance
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## x Fold02: preprocessor 1/1, model 1/1 (predictions): Error in prob.model(object)[[p]]$A: $ operator is invalid for atomic vec...
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## ✓ Estimating performance
+```
+
+```
+## i Gaussian process model
+```
+
+```
+## ✓ Gaussian process model
+```
+
+```
+## i Generating 5000 candidates
+```
+
+```
+## i Predicted candidates
+```
+
+```
+## i Estimating performance
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## ✓ Estimating performance
+```
+
+```
+## i Gaussian process model
+```
+
+```
+## ✓ Gaussian process model
+```
+
+```
+## i Generating 5000 candidates
+```
+
+```
+## i Predicted candidates
+```
+
+```
+## i Estimating performance
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## ✓ Estimating performance
+```
+
+```
+## i Gaussian process model
+```
+
+```
+## ✓ Gaussian process model
+```
+
+```
+## i Generating 5000 candidates
+```
+
+```
+## i Predicted candidates
+```
+
+```
+## i Estimating performance
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## ✓ Estimating performance
+```
+
+```
+## i Gaussian process model
+```
+
+```
+## ✓ Gaussian process model
+```
+
+```
+## i Generating 5000 candidates
+```
+
+```
+## i Predicted candidates
+```
+
+```
+## i Estimating performance
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## ✓ Estimating performance
+```
+
+```
+## i Gaussian process model
+```
+
+```
+## ✓ Gaussian process model
+```
+
+```
+## i Generating 5000 candidates
+```
+
+```
+## i Predicted candidates
+```
+
+```
+## i Estimating performance
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## ✓ Estimating performance
+```
+
+```
+## i Gaussian process model
+```
+
+```
+## ✓ Gaussian process model
+```
+
+```
+## i Generating 5000 candidates
+```
+
+```
+## i Predicted candidates
+```
+
+```
+## i Estimating performance
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## ✓ Estimating performance
+```
+
+```
+## i Gaussian process model
+```
+
+```
+## ✓ Gaussian process model
+```
+
+```
+## i Generating 5000 candidates
+```
+
+```
+## i Predicted candidates
+```
+
+```
+## i Estimating performance
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## ✓ Estimating performance
+```
+
+```
+## i Gaussian process model
+```
+
+```
+## ✓ Gaussian process model
+```
+
+```
+## i Generating 5000 candidates
+```
+
+```
+## i Predicted candidates
+```
+
+```
+## i Estimating performance
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## ✓ Estimating performance
+```
+
+```
+## i Gaussian process model
+```
+
+```
+## ✓ Gaussian process model
+```
+
+```
+## i Generating 5000 candidates
+```
+
+```
+## i Predicted candidates
+```
+
+```
+## i Estimating performance
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## ✓ Estimating performance
+```
+
+```
+## i Gaussian process model
+```
+
+```
+## ✓ Gaussian process model
+```
+
+```
+## i Generating 5000 candidates
+```
+
+```
+## i Predicted candidates
+```
+
+```
+## i Estimating performance
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## ✓ Estimating performance
+```
+
+```
+## i Gaussian process model
+```
+
+```
+## ✓ Gaussian process model
+```
+
+```
+## i Generating 5000 candidates
+```
+
+```
+## i Predicted candidates
+```
+
+```
+## i Estimating performance
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## ✓ Estimating performance
+```
+
+```
+## i Gaussian process model
+```
+
+```
+## ✓ Gaussian process model
+```
+
+```
+## i Generating 5000 candidates
+```
+
+```
+## i Predicted candidates
+```
+
+```
+## i Estimating performance
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## ✓ Estimating performance
+```
+
+```
+## i Gaussian process model
+```
+
+```
+## ✓ Gaussian process model
+```
+
+```
+## i Generating 5000 candidates
+```
+
+```
+## i Predicted candidates
+```
+
+```
+## i Estimating performance
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## ✓ Estimating performance
+```
+
+```
+## i Gaussian process model
+```
+
+```
+## ✓ Gaussian process model
+```
+
+```
+## i Generating 5000 candidates
+```
+
+```
+## i Predicted candidates
+```
+
+```
+## i Estimating performance
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## ✓ Estimating performance
+```
+
+```
+## i Gaussian process model
+```
+
+```
+## ✓ Gaussian process model
+```
+
+```
+## i Generating 5000 candidates
+```
+
+```
+## i Predicted candidates
+```
+
+```
+## i Estimating performance
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## ✓ Estimating performance
+```
+
+```
+## i Gaussian process model
+```
+
+```
+## ✓ Gaussian process model
+```
+
+```
+## i Generating 5000 candidates
+```
+
+```
+## i Predicted candidates
+```
+
+```
+## i Estimating performance
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## ✓ Estimating performance
+```
+
+```
+## ! No improvement for 10 iterations; returning current results.
+```
+
+The search process starts with an initial best value of 0.8659 for the area under the ROC curve. A GP model uses these 4 statistics to create a model. The large candidate set is automatically generated and scored using the expected improvement acquisition function. 
+
+Results were supposed to be: The search continues. There were a total of 9 improvements in the outcome along the way at iterations 3,4,5,6,8,13,22,23, and 24. The best results occurred at iteration 24 with an area under the ROC curve of 0.8986.
+
+The functions that are used to interrogate the results are the same as those used for grid_search (e.g. collect_metrics, etc.)
+
+
+```r
+show_best(svm_bo)
+```
+
+```
+## # A tibble: 5 × 9
+##    cost rbf_sigma .metric .estimator  mean     n std_err .config .iter
+##   <dbl>     <dbl> <chr>   <chr>      <dbl> <int>   <dbl> <chr>   <int>
+## 1  22.3   0.00200 roc_auc binary     0.899    10 0.00782 Iter15     15
+## 2  31.5   0.00176 roc_auc binary     0.899    10 0.00781 Iter19     19
+## 3  15.8   0.00239 roc_auc binary     0.899    10 0.00781 Iter12     12
+## 4  29.7   0.00225 roc_auc binary     0.898    10 0.00778 Iter10     10
+## 5  11.0   0.00345 roc_auc binary     0.898    10 0.00822 Iter8       8
+```
+
+The autoplot() function has several options for iterative search methods. This graph shows how the outcome changed over the search:
+
+
+```r
+autoplot(svm_bo, type = "performance")
+```
+
+![](Chapter_14_files/figure-html/unnamed-chunk-8-1.png)<!-- -->
+
+Plot of parameter values over iterations
+
+
+```r
+autoplot(svm_bo, type="parameters")
+```
+
+![](Chapter_14_files/figure-html/unnamed-chunk-9-1.png)<!-- -->
+
+While the best tuning parameter combination is on the boundary of the parameter space, Bayesian optimization will often choose new points on other sides of the boundary. While we can adjust the ratio of exploration and exploitation, the search tends to sample boundary points early on. 
+
+If the user interrupts the tune_bayes() computations, the function returns the current results (instead of resulting in an error).
+
+### 14.3 simulated annealing
+
+Simulated annealing is a general nonlinear search routine inspired by the process of which metal cools. It is a global search method that can effectively navigate many different types of search landscapes, including discontinuous functions. Unlike most gradient-based optimization routines, simulated annealing can reassess previous solutions.
+
+#### 14.3.1 Simulated annealing search process
+
+The process of using simulated annealing starts with an initial value and embarks on a controlled random walk through the parameter space. Each new candidate parameter value is a small perturbation of the previous value that keeps the new point within a local neighborhood. 
+
+The candidate point is resampled to obtain its corresponding performance value. If this achieves better results than the previous parameters, it is accepted as the new best and the process continues. If the results are worse than the previous value the search procedure may still use this parameter to define further steps. This depends on two factors. First, the likelihood of accepting a bad result decreases as performance becomes worse. In other words, a slighly worse result has a better chance of acceptance than one with a large drop in performance. The other factor is the number of search iterations. Simulated annealing wants to accept fewer suboptimal values as the search proceeds. From these two factors, the acceptance probability for a bad result can be formalized. 
+
+For a bad result, we determine the acceptance probability and compare it to a random uniform number. If the random number is greater than the probability value, the search discards the current parameters and the next iteration creates its candidate value in the neighborhood of the previous value. Otherwise, the next iteration forms the next set of parameters based on the current suboptimal values.
+
+The acceptance probabilities of simulated annealing allow the search to proceed in the wrong direction, at least for the short term, with the potential to find a much better region of the paramter space in the long run.
+
+The user can adjust the coefficients to find a probability profile that suits their needs. In finetune::control_sim_anneal(), the default for this cooling_coef argument is 0.002. Decreasing this coefficient will encourage the search to be more forgiving of poor results. 
+
+This process continues for a set amount of iterations but can halt if no globally best results occur within a pre-determined number of iterations. However, it can be very helpful to set a restart threshold. If there are a string of failures, this feature revisits the last globally best parameter settings and starts anew. 
+
+The main important detail is to define how to perturb the tuning parameters from iteration to iteration. There are a variety of methods in the literature for this. We follow the method generalized simulated annealing. For continuous tuning parameters, we define a small radius to specify the local "neighborhood". The size of the radius controls how quickly the search explores the parameter space. For non-numeric parameters, we assign a probability for how often the parameter value changes. 
+
+#### 14.3.2 The tune_sim_anneal() function
+
+To implement iterative search via simulated annealing, use the tune_sim_anneal() function. The syntax for this function is nearly identical to tune_bayes(). There are no options for acquisition functions or uncertainty sampling. The control_sim_anneal() function has some details that define the local neighborhood and the cooling schedule:
+
+* no_improve: for simulated annealing, is an integer that will stop the search if no global best or improved results are discovered within no_improve iterations. Accepted suboptimal or discarded parameters count as "no improvement"
+* restart: is the number of iterations with no new best results before starting from the previous best results.
+* radius: is a numeric vector on (0,1) that defines the minimym and maximum radius of the local neighborhood around the intitial point.
+* flip: is a probability value that defines the chances of altering the value of categorical or integer parameters.
+* cooling_coef: is the c coefficient in exp(c x Di x i) that modulates how quickly the acceptance probability decreases over iterations. Larger values of cooling_coef decrease the probability of accpeting a suboptimal parameter setting. 
+
+For the cell segmentation data, the syntax is very consistent with the previously used functions:
+
+
+```r
+library(finetune)
+ctrl_sa <- control_sim_anneal(verbose = TRUE, no_improve = 10L)
+
+set.seed(1404)
+svm_sa <-
+  svm_wflow %>%
+  tune_sim_anneal(
+    resamples = cell_folds,
+    metrics = roc_res,
+    initial = svm_initial,
+    param_info = svm_param,
+    iter = 50,
+    control = ctrl_sa
+  )
+```
+
+```
+## Optimizing roc_auc
+```
+
+```
+## Initial best: 0.86594
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## 1 ◯ accept suboptimal  roc_auc=0.86351 (+/-0.008642)
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## 2 ♥ new best           roc_auc=0.87334 (+/-0.008402)
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## 3 ◯ accept suboptimal  roc_auc=0.86724 (+/-0.00838)
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## 4 + better suboptimal  roc_auc=0.87042 (+/-0.008147)
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## 5 ♥ new best           roc_auc=0.87444 (+/-0.008459)
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## 6 ◯ accept suboptimal  roc_auc=0.86966 (+/-0.00811)
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## 7 ◯ accept suboptimal  roc_auc=0.86589 (+/-0.008448)
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## 8 ◯ accept suboptimal  roc_auc=0.86233 (+/-0.008657)
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## 9 ◯ accept suboptimal  roc_auc=0.8623 (+/-0.008648)
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## 10 + better suboptimal  roc_auc=0.86232 (+/-0.008658)
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## 11 + better suboptimal  roc_auc=0.86238 (+/-0.008671)
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## 12 + better suboptimal  roc_auc=0.86246 (+/-0.008646)
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## 13 ✖ restart from best  roc_auc=0.86254 (+/-0.008613)
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## 14 ◯ accept suboptimal  roc_auc=0.87261 (+/-0.008351)
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## 15 + better suboptimal  roc_auc=0.8728 (+/-0.008301)
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## 16 ♥ new best           roc_auc=0.88979 (+/-0.00886)
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## 17 ♥ new best           roc_auc=0.89188 (+/-0.008923)
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## x Fold04: preprocessor 1/1, model 1/1 (predictions): Error in prob.model(object)[[p]]$A: $ operator is invalid for atomic vec...
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## 18 ♥ new best           roc_auc=0.89589 (+/-0.0091)
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## 19 ◯ accept suboptimal  roc_auc=0.89444 (+/-0.008826)
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## 20 ◯ accept suboptimal  roc_auc=0.87818 (+/-0.008519)
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## 21 ◯ accept suboptimal  roc_auc=0.87445 (+/-0.008274)
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## 22 + better suboptimal  roc_auc=0.8748 (+/-0.008468)
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## 23 + better suboptimal  roc_auc=0.87874 (+/-0.008594)
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## 24 ─ discard suboptimal roc_auc=0.86945 (+/-0.008255)
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## 25 ─ discard suboptimal roc_auc=0.86601 (+/-0.008643)
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## 26 ✖ restart from best  roc_auc=0.87029 (+/-0.008407)
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## 27 ◯ accept suboptimal  roc_auc=0.88689 (+/-0.008385)
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## 28 ♥ new best           roc_auc=0.89634 (+/-0.008367)
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## 29 ◯ accept suboptimal  roc_auc=0.89295 (+/-0.00849)
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## 30 ─ discard suboptimal roc_auc=0.86988 (+/-0.009097)
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## 31 ─ discard suboptimal roc_auc=0.88745 (+/-0.008767)
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## 32 ◯ accept suboptimal  roc_auc=0.8825 (+/-0.009001)
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## 33 + better suboptimal  roc_auc=0.88294 (+/-0.008897)
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## 34 ♥ new best           roc_auc=0.89717 (+/-0.008342)
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## 35 ♥ new best           roc_auc=0.89852 (+/-0.007916)
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## x Fold02: preprocessor 1/1, model 1/1 (predictions): Error in prob.model(object)[[p]]$A: $ operator is invalid for atomic vec...
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## 36 ─ discard suboptimal roc_auc=0.88392 (+/-0.00902)
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## 37 ◯ accept suboptimal  roc_auc=0.89735 (+/-0.00828)
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## 38 ◯ accept suboptimal  roc_auc=0.89612 (+/-0.008263)
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## 39 ─ discard suboptimal roc_auc=0.8594 (+/-0.009613)
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## x Fold04: preprocessor 1/1, model 1/1 (predictions): Error in prob.model(object)[[p]]$A: $ operator is invalid for atomic vec...
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## 40 ─ discard suboptimal roc_auc=0.88475 (+/-0.009126)
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## 41 + better suboptimal  roc_auc=0.89697 (+/-0.008169)
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## 42 ◯ accept suboptimal  roc_auc=0.89652 (+/-0.008551)
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## 43 ✖ restart from best  roc_auc=0.88427 (+/-0.00854)
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## 44 ─ discard suboptimal roc_auc=0.86189 (+/-0.009741)
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## 45 ◯ accept suboptimal  roc_auc=0.89751 (+/-0.008204)
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## 46 ─ discard suboptimal roc_auc=0.86177 (+/-0.009517)
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## 47 ─ discard suboptimal roc_auc=0.87757 (+/-0.008934)
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## 48 ─ discard suboptimal roc_auc=0.87337 (+/-0.009258)
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## 49 ◯ accept suboptimal  roc_auc=0.89664 (+/-0.00854)
+```
+
+```
+## i Fold01: preprocessor 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold01: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold01: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold02: preprocessor 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold02: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold02: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold03: preprocessor 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold03: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold03: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold04: preprocessor 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold04: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold04: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold05: preprocessor 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold05: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold05: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold06: preprocessor 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold06: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold06: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold07: preprocessor 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold07: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold07: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold08: preprocessor 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold08: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold08: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold09: preprocessor 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold09: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold09: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## i Fold10: preprocessor 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## ✓ Fold10: preprocessor 1/1, model 1/1
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (extracts)
+```
+
+```
+## i Fold10: preprocessor 1/1, model 1/1 (predictions)
+```
+
+```
+## 50 ─ discard suboptimal roc_auc=0.88419 (+/-0.008839)
+```
+
+
+```r
+autoplot(svm_sa, type = "performance") 
+```
+
+![](Chapter_14_files/figure-html/unnamed-chunk-11-1.png)<!-- -->
+
+
+```r
+autoplot(svm_sa, type = "parameters") 
+```
+
+![](Chapter_14_files/figure-html/unnamed-chunk-12-1.png)<!-- -->
+
