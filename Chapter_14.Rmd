@@ -7,6 +7,8 @@ output:
     keep_md: yes
 ---
 
+Add in the code here to activate more cores to run faster. From chapter 10.
+
 ## Chapter 14 Iterative Search
 
 Grid search takes a pre-defined set of candidate values, evaluates them, then chooses the best settings. Iterative search predicts which values to test next.
