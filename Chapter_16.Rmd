@@ -1,0 +1,400 @@
+---
+title: "Chapter_16"
+author: "Sam Worthy"
+date: "2024-03-31"
+output: 
+  html_document: 
+    keep_md: yes
+---
+
+## Dimensionality Reduction
+
+Dimensionality reduction transforms a data set from a high-dimensional space into a low-dimensional space.
+
+### 16.1 What problems can dimensionality reduction solve?
+
+Dimensionality reduction can be used either in feature engineering or in exploratory data analysis. Consequences of high-dimensional data:
+
+1. debugging the data is difficult when there are hundreds of thousands of dimensions
+2. having a multitude of predictors can harm the model, e.g. number of predictors should be less than the number of data points used to fit the model
+3. multicollinearity, where between-predictor correlations can negatively impact the mathematical operations used to estimate a model.
+
+Most dimensionality reduction techniques can only be effective when there are such relationships between predictors that can be exploited.
+
+Principal component analysis (PCA) is one of the most straightforward methods for reducting the number of columns in the data set b/c it relies on linear methods and is unsupervised (i.e. does not consider the outcome data).
+
+The dimensionality reduction methods discussed in this chapter are generally NOT feature selection methods. Methods such as PCA represent the original predictors using a smaller subset of new features. All of the original predictors are required to compute these new features. The exception to this are sparse methods that have the ability to completely remove the impact of predictors when creating the new features. 
+
+```{r}
+library(tidymodels)
+tidymodels_prefer()
+library(baguette)
+library(beans)
+library(bestNormalize)
+library(corrplot)
+library(discrim)
+library(embed)
+library(ggforce)
+library(klaR)
+library(learntidymodels)
+library(mixOmics)
+library(uwot)
+library(patchwork)
+library(fastICA)
+library(mda)
+library(earth)
+```
+
+### 16.2 A picture is worth a thousand...beans
+
+Let's walk through how to use dimensionality reduction with recipes for an example data set. In the bean data, 16 morphology features were computed.
+
+We start by holding back a testing set with initial_split(). The remaining data are split into training and validation sets.
+
+```{r}
+set.seed(1601)
+bean_split <- initial_validation_split(beans, strata = class, prop = c(0.75, 0.125))
+
+bean_split
+
+# Return data frames:
+bean_train <- training(bean_split)
+bean_test <- testing(bean_split)
+bean_validation <- validation(bean_split)
+
+
+set.seed(1602)
+# Return an 'rset' object to use with the tune functions:
+bean_val <- validation_set(bean_split)
+bean_val$splits[[1]]
+
+```
+
+To visually assess how well different methods perform, we can estimate the methods on the training set (n=10,206 beans) and display the results using the validation set (n=1,702). 
+
+Before beginning any dimensionality reduction, we can spend some time investigating our data. Let's take a look at the correlation strucutre of the data.
+
+```{r}
+tmwr_cols <- colorRampPalette(c("#91CBD765", "#CA225E"))
+bean_train %>% 
+  select(-class) %>% 
+  cor() %>% 
+  corrplot(col = tmwr_cols(200), tl.col = "black", method = "ellipse")
+```
+
+Many of these predictors are highly correlated, such as area and perimeter or shape factors 2 and 3. While we don't take the time to do it here, it is also important to see if this correlation structure significantly changes across the outcome categories. 
+
+### 16.3 A starter recipe
+
+It's time to look at the beans data in a smaller space. We can start with a basic recipe to preprocess the data prior to any dimensionality reduction steps. Several predictors are ratios and so are likely to have skewed distributions. Such distributions can wreak havoc on variance calculations. The bestNormalize package has a step that can enforce a symmetric distribution for the predictors. We'll use this to mitigate the issue of skewed distributions. 
+
+```{r}
+bean_rec <-
+  # Use the training data from the bean_val split object
+  recipe(class ~ ., data = bean_train) %>%
+  step_zv(all_numeric_predictors()) %>%
+  step_orderNorm(all_numeric_predictors()) %>% 
+  step_normalize(all_numeric_predictors())
+```
+
+Remember that when invoking the recipe() function, the steps are not estimated or executed in any way.
+
+### 16.4 Recipes in the wild
+
+A workflow containing a recipe uses fit() to estimate the recipe and model, then predict() to process the data and make model predictions. There are analogous functions in the recipes package that can be used for the same purpose:
+
+* prep(recipe, training) fits the recipe to the training set
+* bake(recipe, new_data) applies the recipe operations to new_data.
+
+#### 16.4.1 Preparing a recipe
+
+Let's estimate bean_rec using the training set data, with prep(bean_rec).
+
+```{r}
+bean_rec_trained <- prep(bean_rec)
+bean_rec_trained
+```
+
+Note in the output that the steps have been trained and that the selectors are no longer general (i.e. all_numeric_predictors()); they now show the actual columns that were selected. Also, prep(bean_rec) does not require the training argument. You can pass any data into that argument, but omitting it means that the original data from the call to recipe() will be used. In our case this was the training set data.
+
+One important argument to prep() is retain. When retain=TRUE (the default), the estimated version of the training set is kept within the recipe. This data set has been pre-processed using all of the steps listed in the recipe. Since prep() has to execute the recipe as it proceeds, it may be advantageous to keep this version of the training set so that, if that data set is to be used later, redundant calculations can be avoided. However, if the training set is big, it may be problematic to keep such a large amount of data in memory. Use retain=FALSE ot avoid this.
+
+Once new steps are added to this recipe, reapplying prep() will estimate only the untrained steps.This will come in handy when we try different feature extraction methods.
+
+If you encounter errors when working with a recipe, prep() can be used with its verbose option to troubleshoot.
+
+```{r, eval=FALSE}
+bean_rec_trained %>% 
+  step_dummy(cornbread) %>%  # <- not a real predictor
+  prep(verbose = TRUE)
+```
+
+Another option that can help you understand when happens in the analysis is log_changes
+
+```{r}
+show_variables <- 
+  bean_rec %>% 
+  prep(log_changes = TRUE)
+```
+
+#### 16.4.2 Baking the recipe
+
+Using bake() with a recipe is much like using predict() with a model: the operations estimated from the training set are applied to any data, like testing data or new data at prediction time.
+
+For example, the validation set samples can be processed:
+
+```{r}
+bean_val_processed <- bake(bean_rec_trained, new_data = bean_validation)
+```
+
+Histograms of the area predictor before and after the recipe was prepared.
+
+```{r}
+p1 <- 
+  bean_validation %>% 
+  ggplot(aes(x = area)) + 
+  geom_histogram(bins = 30, color = "white", fill = "blue", alpha = 1/3) + 
+  ggtitle("Original validation set data")
+
+p2 <- 
+  bean_val_processed %>% 
+  ggplot(aes(x = area)) + 
+  geom_histogram(bins = 30, color = "white", fill = "red", alpha = 1/3) + 
+  ggtitle("Processed validation set data")
+
+p1 + p2
+```
+
+Two important aspects of bake() are worth noting here. First, as previously mentioned, using prep(recipe, retain=TRUE) keeps the existing processed version of the training set in the recipe. This enables the user to use bake(recipe, new_data=NULL), which returns that data set without further computations. 
+
+```{r}
+bake(bean_rec_trained, new_data = NULL) %>% nrow()
+
+bean_train %>% nrow()
+
+```
+
+If the training set is not pathologically large, using this value to retain can save a lot of computational time. Second, additional selectors can be used in the call to specify which columns to return. The default selector is everything(), but more specific directives can be used.
+
+### 16.5 Feature extraction techniques
+
+Since recipes are the primary option in tidymodels for dimensionality reduction, let's write a function that will estimate the transformation and plot the resulting data in a scatter plot matrix via the ggforce package. 
+
+```{r}
+plot_validation_results <- function(recipe, dat = bean_validation) {
+  recipe %>%
+    # Estimate any additional steps
+    prep() %>%
+    # Process the data (the validation set by default)
+    bake(new_data = dat) %>%
+    # Create the scatterplot matrix
+    ggplot(aes(x = .panel_x, y = .panel_y, color = class, fill = class)) +
+    geom_point(alpha = 0.4, size = 0.5) +
+    geom_autodensity(alpha = .3) +
+    facet_matrix(vars(-class), layer.diag = 2) + 
+    scale_color_brewer(palette = "Dark2") + 
+    scale_fill_brewer(palette = "Dark2")
+}
+```
+
+### 16.5.1 PCA
+
+PCA is an unsupervised method that used linear combinations of the predictors to define new features. These features attempt to account for as much variation as possible in the original data. We add step_pca() to the original recipe and use our function to visualize the results on the validation set. 
+
+```{r}
+bean_rec_trained %>%
+  step_pca(all_numeric_predictors(), num_comp = 4) %>%
+  plot_validation_results() + 
+  ggtitle("Principal Component Analysis")
+```
+
+We see that the first two components PC1 and PC2, especially when used together, do an effective job distinguishing between or separating the classes. This may lead us to expect that the overall problem of classifying these beans will not be especially difficult. 
+
+For these data, it turns out that the PCA components that explain the most variation in the predictors also happen to be predictive of the classes. What features are driving performance? The learntidymodels package has functions that can help visualize the top features for each component. We'll need the prepared recipe; the PCA step is added in the following code alogn with a call to prep().
+
+```{r}
+bean_rec_trained %>%
+  step_pca(all_numeric_predictors(), num_comp = 4) %>% 
+  prep() %>% 
+  plot_top_loadings(component_number <= 4, n = 5) + 
+  scale_fill_brewer(palette = "Paired") +
+  ggtitle("Principal Component Analysis")
+```
+
+The top loadings are mostly related to the cluster of correlated predictors: perimeter, area, major axis length, and convex area. These are all related to bean size. Measures of elongation appear to dominate the second PCA component. 
+
+### 16.5.2 Partial least squares
+
+PLS is a supervised version of PCA. It tries to find components that simultaneously maximize the variation in the predictors while also maximizing the relationship between those components and the outcome. 
+
+```{r}
+bean_rec_trained %>%
+  step_pls(all_numeric_predictors(), outcome = "class", num_comp = 4) %>%
+  plot_validation_results() + 
+  ggtitle("Partial Least Squares")
+```
+
+The first two PLS components are nearly identical to the first two PCA components. 
+
+```{r}
+bean_rec_trained %>%
+  step_pls(all_numeric_predictors(), outcome = "class", num_comp = 4) %>%
+  prep() %>% 
+  plot_top_loadings(component_number <= 4, n = 5, type = "pls") + 
+  scale_fill_brewer(palette = "Paired") +
+  ggtitle("Partial Least Squares")
+```
+
+### 16.5.3 Independent component analysis
+
+ICA is slightly different than PCA in that it finds components that are as statistically independent from one another as possible (as opposed to being uncorrelated). It can be thought of as maximizing the "non-Gaussianity" of the ICA components, or separating information instead of compressing information like PCA. 
+
+```{r}
+bean_rec_trained %>%
+  step_ica(all_numeric_predictors(), num_comp = 4) %>%
+  plot_validation_results() + 
+  ggtitle("Independent Component Analysis")
+```
+
+Inspecting this plot, there does not appear to be much separation between the classes in the few components when using ICA. These independent components do not separate the bean types.
+
+### 16.5.4 Uniform manifold approximation and projection
+
+UMAP is similar to the popular t-SNE method for nonlinear dimensions reduction. In the original high-dimensional space, UMAP uses a distance-based nearest neighbor method to find local areas of the data where the data points are more likely to be related. The relationship between data points is saved as a directed graph model where most points are not connected. 
+
+From there, UMAP translates points in the graph to the reduced dimensional space. To do this, the algorithm has an optimization process that uses cross-entropy to map data points to the smaller set of features so that the graph is well approximated. 
+
+To create the mapping, the embed package contains a step function for this method.
+
+```{r}
+bean_rec_trained %>%
+  step_umap(all_numeric_predictors(), num_comp = 4) %>%
+  plot_validation_results() +
+  ggtitle("UMAP")
+```
+
+While the between-cluster space is pronounced, the clusters can contain a heterogenous mixture of classes. 
+
+There is also a supervised version of UMAP:
+
+```{r}
+bean_rec_trained %>%
+  step_umap(all_numeric_predictors(), outcome = "class", num_comp = 4) %>%
+  plot_validation_results() +
+  ggtitle("UMAP (supervised)")
+```
+
+The supervised method looks promising for modeling the data.
+
+UMAP is a powerful method to reduce the feature space. However, it can be very sensitive to tuning parameters (e.g. the number of neighbors and so on). For this reason, it would help to experiment with a few of the parameters to assess how robust the results are for these data.
+
+### 16.6 Modeling
+
+Both the PLS and UMAP methods are worth investigating in conjuction with different models. Let's explore a variety of different models with these dimensionality reduction techniques (along with no transformation at all): a single layer neural network, bagged trees, flexible discriminant analysis (FDA), naive Bayes, and regularized discriminant analysis (RDA). 
+
+Now that we are back in "modeling mode", we'll create a series of model specifications and then use a workflow set to tune the models in the following code. Note that the model parameters are tuned in conjunction with the recipe parameters (e.g. size of the reduced dimension, UMAP parameters).
+
+```{r}
+mlp_spec <-
+  mlp(hidden_units = tune(), penalty = tune(), epochs = tune()) %>%
+  set_engine('nnet') %>%
+  set_mode('classification')
+
+bagging_spec <-
+  bag_tree() %>%
+  set_engine('rpart') %>%
+  set_mode('classification')
+
+fda_spec <-
+  discrim_flexible(
+    prod_degree = tune()
+  ) %>%
+  set_engine('earth')
+
+rda_spec <-
+  discrim_regularized(frac_common_cov = tune(), frac_identity = tune()) %>%
+  set_engine('klaR')
+
+bayes_spec <-
+  naive_Bayes() %>%
+  set_engine('klaR')
+```
+
+We also need recipes for the dimensionality reduction methods we'll try. Let's start with a base recipe bean_rec and then extend it with different dimensionality reduction steps.
+
+```{r}
+bean_rec <-
+  recipe(class ~ ., data = bean_train) %>%
+  step_zv(all_numeric_predictors()) %>%
+  step_orderNorm(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+pls_rec <- 
+  bean_rec %>% 
+  step_pls(all_numeric_predictors(), outcome = "class", num_comp = tune())
+
+umap_rec <-
+  bean_rec %>%
+  step_umap(
+    all_numeric_predictors(),
+    outcome = "class",
+    num_comp = tune(),
+    neighbors = tune(),
+    min_dist = tune()
+  )
+```
+
+Once again, the workflowsets package takes the preprocessors and models and crosses them. The control option parallel_over is set so that the parallel processing can work simultaneously across tuning parameter combinations. The workflow_map() function applies grid search to optimize the model/preprocessing parameters (if any) across 10 parameter combinations. The multiclass area under the ROC curve is estimated on the validation set.
+
+```{r}
+ctrl <- control_grid(parallel_over = "everything")
+bean_res <- 
+  workflow_set(
+    preproc = list(basic = class ~., pls = pls_rec, umap = umap_rec), 
+    models = list(bayes = bayes_spec, fda = fda_spec,
+                  rda = rda_spec, bag = bagging_spec,
+                  mlp = mlp_spec)
+  ) %>% 
+  workflow_map(
+    verbose = TRUE,
+    seed = 1603,
+    resamples = bean_val,
+    grid = 10,
+    metrics = metric_set(roc_auc),
+    control = ctrl
+  )
+```
+
+We can rank the models by their validation set estimates of the area under the ROC curves
+
+```{r}
+rankings <- 
+  rank_results(bean_res, select_best = TRUE) %>% 
+  mutate(method = map_chr(wflow_id, ~ str_split(.x, "_", simplify = TRUE)[1])) 
+
+tidymodels_prefer()
+filter(rankings, rank <= 5) %>% dplyr::select(rank, mean, model, method)
+
+```
+
+It is clear from these results that most models give very good performance; there are a few bad choices here. For demonstrations, we'll use the RDA model with PLS features as the final model. We will finalize the workflow with the numerically best parameters, fit it to the training set, then evaluate with the test set. 
+
+```{r}
+rda_res <- 
+  bean_res %>% 
+  extract_workflow("pls_rda") %>% 
+  finalize_workflow(
+    bean_res %>% 
+      extract_workflow_set_result("pls_rda") %>% 
+      select_best(metric = "roc_auc")
+  ) %>% 
+  last_fit(split = bean_split, metrics = metric_set(roc_auc))
+
+rda_wflow_fit <- extract_workflow(rda_res)
+```
+
+What are the results of our metric on the testing set?
+```{r}
+collect_metrics(rda_res)
+```
+
