@@ -72,7 +72,7 @@ bean_val$splits[[1]]
 
 To visually assess how well different methods perform, we can estimate the methods on the training set (n=10,206 beans) and display the results using the validation set (n=1,702). 
 
-Before beginning any dimensionality reduction, we can spend some time investigating our data. Let's take a look at the correlation strucutre of the data.
+Before beginning any dimensionality reduction, we can spend some time investigating our data. Let's take a look at the correlation structure of the data.
 
 ```{r}
 tmwr_cols <- colorRampPalette(c("#91CBD765", "#CA225E"))
