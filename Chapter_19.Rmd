@@ -262,4 +262,4 @@ These seem fairly reasonable. For the 2020 data:
 score(pca_stat, Chicago_2020) %>% select(starts_with("distance"))
 ```
 
-The 2020 distance values indicate that these predictor values are outside of the vast majority of data seen by the model at training time. These should be flagges so that the predictiions are either not reported at all or viewed with skepticism. 
+The 2020 distance values indicate that these predictor values are outside of the vast majority of data seen by the model at training time. These should be flagged so that the predictions are either not reported at all or viewed with skepticism. 

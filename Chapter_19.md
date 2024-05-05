@@ -45,7 +45,7 @@ library(tidymodels)
 ## ✖ dplyr::filter()  masks stats::filter()
 ## ✖ dplyr::lag()     masks stats::lag()
 ## ✖ recipes::step()  masks stats::step()
-## • Use tidymodels_prefer() to resolve common conflicts.
+## • Use suppressPackageStartupMessages() to eliminate package startup messages
 ```
 
 ```r
@@ -492,4 +492,4 @@ score(pca_stat, Chicago_2020) %>% select(starts_with("distance"))
 ## 14    10.7            1
 ```
 
-The 2020 distance values indicate that these predictor values are outside of the vast majority of data seen by the model at training time. These should be flagges so that the predictiions are either not reported at all or viewed with skepticism. 
+The 2020 distance values indicate that these predictor values are outside of the vast majority of data seen by the model at training time. These should be flagged so that the predictions are either not reported at all or viewed with skepticism. 

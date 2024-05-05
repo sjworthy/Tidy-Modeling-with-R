@@ -66,6 +66,7 @@ poly_recipe <-
 For the models, we use the parsnip addin to create a set of model specifications.
 
 ```{r}
+library(parsnip)
 library(rules)
 library(baguette)
 
