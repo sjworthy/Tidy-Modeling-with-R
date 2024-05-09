@@ -29,7 +29,7 @@ Let's consider the multilayer perceptron (MLP) (a.k.a. neural network). We'll ta
 
 Tuning parameters are an important aspect of a model. In the previous chapters, we've called these candidate tuning parameter values or model configurations. In literature on ensembling these have also been called the base models. We'll use the term candidate members to describe the possible model configurations (of all model types) that might be included in the stacking ensemble. 
 
-This means taht a stacking model can include different types of models (e.g. trees and neural networks) as well as different configurations of the same model (e.g. trees with different depths).
+This means that a stacking model can include different types of models (e.g. trees and neural networks) as well as different configurations of the same model (e.g. trees with different depths).
 
 ### 20.1 Creating the training set for stacking
 
@@ -324,4 +324,4 @@ ens_test_pred %>%
   reg_metrics(compressive_strength, .pred)
 ```
 
-This is moderately better than our best single model. It is fairly common for stacking to produce incremental benefits when compared ot the best single model.
+This is moderately better than our best single model. It is fairly common for stacking to produce incremental benefits when compared to the best single model.
