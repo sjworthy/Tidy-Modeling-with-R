@@ -177,7 +177,7 @@ glm_boot <-
 glm_boot
 ```
 
-When we compare these results to the purely parametric results from glm(), the bootstrap intervals are somewhat wider. If the data were truly Poisson, these interval swould have more similar widths.
+When we compare these results to the purely parametric results from glm(), the bootstrap intervals are somewhat wider. If the data were truly Poisson, these interval should have more similar widths.
 
 Determining which predictors to include in the model is a difficult problem. One approach is to conduct likelihood ratio test (LRT) between nested models. Based on the confidence intervals, we have evidence that a simpler model without phd may be sufficient. Let's fit a smaller model, then conduct a statistical test.
 
@@ -239,7 +239,7 @@ log_lin_reduced   %>% extract_fit_engine() %>% AIC()
 
 However, it's hard to contextualize this pair of single values and assess how different they actually are. To solve this problem, we'll resample a large number of each of these two models. From these, we can compute the AIC values for each and determine how often the results favor the ZIP model. Basically, we will be characterizing the uncertainity of the AIC statistics to gauge their difference relative to the noise in the data.
 
-We'll also compute more bootstrap confidence intervals for the parameters in a bit so we specify the apparen=TRUE option when creating the bootstrap samples. This is required for some types of intervals.
+We'll also compute more bootstrap confidence intervals for the parameters in a bit so we specify the apparent=TRUE option when creating the bootstrap samples. This is required for some types of intervals.
 
 First, we create the 4,000 model fits:
 
