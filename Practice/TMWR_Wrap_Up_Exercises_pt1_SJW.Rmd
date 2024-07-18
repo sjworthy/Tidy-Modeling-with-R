@@ -42,7 +42,7 @@ head(dat)
 Making some plots
 
 ```{r}
-ggpairs(data = dat, columns = 3:6)
+ggpairs(data = dat, columns = 3:6, progress = FALSE)
 ```
 
 miles_prev_14 and miles_prev_28 are highly correlated (r = 0.81)
@@ -63,10 +63,10 @@ Would we maybe group by date?
 
 ```{r}
 set.seed(707)
-hr_split = initial_split(dat, prop = 0.75)
+hr_split = group_initial_split(dat, group = name)
 hr_train = training(hr_split)
 hr_test = testing(hr_split)
-hr_folds <- rsample::vfold_cv(hr_train, v = 5)
+hr_folds <- group_vfold_cv(hr_train, group = name, v = 5)
 ```
 
 ## Exercise 2. Create some recipes
@@ -89,6 +89,16 @@ rec_normal
 ```
 
 Check to make sure your recipes are working as expected
+
+
+```{r}
+rec_simple %>% prep() %>% bake(hr_train) %>% head()
+```
+
+
+```{r}
+rec_normal %>% prep() %>% bake(hr_train) %>% summary()
+```
 
 ## Exercise 3 Create two model specifications
 
@@ -122,17 +132,6 @@ Use the v-fold resampling to fit models and tune the hyper parameters using a gr
 
 I recommend leaving `save_pred = FALSE` and `save_workflow = FALSE` (these are the defaults).  This is contrary to some of the scripts in the book, but I think Rstudio stays happier with these settings.
 
-Creating a random grid of size 10 for the lm_pen parameters
-
-```{r}
-lm_pen_param <- 
-  lm_pen_wkflow %>%
-  extract_parameter_set_dials()
-lm_pen_param
-lm_pen_param %>% 
-  grid_random(size = 10) %>% # 'size' is the number of combinations
-  summary()
-```
 
 ```{r}
 parallel::detectCores(logical = FALSE)
@@ -145,12 +144,12 @@ registerDoMC(cores = 4)
 
 What is the difference between grid = 10 and grid_random(size = 10)
 
+
 ```{r}
-lm_pen_tune <-
+system.time(lm_pen_tune <-
   lm_pen_wkflow %>%
-  tune_grid(hr_folds,
-            grid = 10,
-            param_info = lm_pen_param)
+  tune_grid(resamples = hr_folds,
+            grid = 10))
  lm_pen_tune 
 ```
 
@@ -158,13 +157,11 @@ lm_pen_tune <-
 Plot the results and also print a table of the best hyperparameters
 
 ```{r}
-autoplot(lm_pen_tune) + 
-  scale_color_viridis_d(direction = -1) + 
-  theme(legend.position = "top")
+autoplot(lm_pen_tune)
 ```
 
 ```{r}
-show_best(lm_pen_tune) %>% select(-.estimator)
+show_best(lm_pen_tune)
 ```
 
 
@@ -181,11 +178,11 @@ library(finetune)
 
 
 ```{r}
-lm_pen_tune_25 <-
+race_ctrl = control_race(save_pred = FALSE, parallel_over = "everything")
+system.time(lm_pen_tune_25 <-
   lm_pen_wkflow %>%
-  tune_race_anova(hr_folds,
-                  grid = 25,
-                  param_info = lm_pen_param)
+  tune_race_anova(resamples = hr_folds,
+                  grid = 25, control = race_ctrl))
  lm_pen_tune_25 
 ```
 
@@ -193,9 +190,7 @@ lm_pen_tune_25 <-
 Plot the results and also print a table of the best models
 
 ```{r}
-autoplot(lm_pen_tune_25) + 
-  scale_color_viridis_d(direction = -1) + 
-  theme(legend.position = "top")
+autoplot(lm_pen_tune_25)
 ```
 
 ```{r}
@@ -220,11 +215,12 @@ both_wkflow %>% extract_workflow(id = "simple_rf")
 
 
 ```{r}
-both_tune_racing <-
+system.time(both_tune_racing <-
   both_wkflow %>%
   workflow_map("tune_race_anova",
                resamples = hr_folds,
-               grid = 25)
+               grid = 25,
+               control=race_ctrl))
  both_tune_racing 
 ```
 
@@ -256,10 +252,9 @@ rf_only = both_tune_racing %>%
 rf_only
 ```
 
+
 ```{r}
-autoplot(rf_only) + 
-  scale_color_viridis_d(direction = -1) + 
-  theme(legend.position = "top")
+autoplot(rf_only)
 ```
 
 ```{r}
@@ -273,10 +268,11 @@ Using the results from Exercise 6 as a starting point, use a Bayesian tune to se
 Hint: you will neeed to use `extract_parameter_set_dials(spec_rf) %>%
   finalize(rides_train)`  to create a parameter set to feed into the Bayesian tuning function
   
+Remove doing this from the previous model and just extract from raw set-up  
+  
 ```{r}
 bayes_param <- 
-  both_tune_racing %>%
-  extract_parameter_set_dials(id = "simple_rf") %>%
+  extract_parameter_set_dials(spec_rf) %>%
   finalize(hr_train)
 bayes_param
 ```
