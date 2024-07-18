@@ -1,0 +1,313 @@
+---
+title: "TMWR_Wrap_Up_Exercises_Part_I"
+author: 
+date: "2024-07-07"
+output: 
+  html_document: 
+    keep_md: yes
+---
+
+We will practice our skills from chapters 11-15 on a new data set.  (We will cover the remaining chapters in the next set of exercises.)
+
+The data set is a sampling of my cycling data from over the last 12 years.  I want to know how well we can predict heart rate from other information in the data sheet.  The original data had a resolution of 1 observation per second for each of the 1,000 or so rides in the data set.  I've reduced this to 1 observation per 5 minutes so that it can be fit in a somewhat reasonable time.
+
+The data set is [ride_data_smaller.csv.gz](https://github.com/jnmaloof/tidy-models/blob/main/ride_data_smaller.csv.gz), which should be attached to the message where you received this file, but if not you can download at the link.
+
+Objectives are to review/practice
+
+* resampling
+* recipes
+* workflows
+* workflow sets
+* tuning
+
+They way I have structured the exercises, we build up from from workflows to a small workflow set, to a large one.  Hopefully this helps with the review.
+
+```{r}
+library(tidymodels)
+tidymodels_prefer()
+library(GGally)
+library(corrplot)
+```
+
+## Exercise 1.  Training/test/cross validation split
+
+Load the data.  Maybe make some diagnostic plaints (hint: ggpairs from GGally is one nice way to do it; hint: you will probably want to subsamble the data before using ggpairs).
+
+```{r}
+dat = read.csv("ride_data_smaller.csv.gz")
+head(dat)
+```
+
+Making some plots
+
+```{r}
+ggpairs(data = dat, columns = 3:6)
+```
+
+miles_prev_14 and miles_prev_28 are highly correlated (r = 0.81)
+
+```{r}
+cor.mat.all = cor(dat[,c(3:8,10:14)],use = "pairwise") 
+corrplot(cor.mat.all, method="number",tl.col = "black", bg = "gray70",is.corr = TRUE,
+         col.lim = c(-1,1), col = COL2('BrBG', 200), addgrid.col = "black")
+```
+```{r}
+ggplot(data = dat, aes(heart_rate)) +
+  geom_histogram()
+```
+
+Set.seed to 707 and make a 75/25 training/test split.  Make a v=5 cross validation set.  Should you be grouping by anything when you make these splits?
+
+Would we maybe group by date?
+
+```{r}
+set.seed(707)
+hr_split = initial_split(dat, prop = 0.75)
+hr_train = training(hr_split)
+hr_test = testing(hr_split)
+hr_folds <- rsample::vfold_cv(hr_train, v = 5)
+```
+
+## Exercise 2. Create some recipes
+
+Create a recipe `rec_simple` that specifies your outcome variable `heart_rate` and predictors (everything but `name`, `date`, and `timestamp`)
+
+```{r}
+rec_simple <- 
+  recipe(heart_rate ~ distance + altitude + speed + cadence + temperature + miles_prev_14 + miles_prev_28 + altitude_delta + jm_age + elapsed_time_m, data = hr_train)
+rec_simple
+```
+
+Create a recipe `rec_normal` that normalizes (centers and scales) all predictors
+
+```{r}
+rec_normal <- 
+  recipe(heart_rate ~ distance + altitude + speed + cadence + temperature + miles_prev_14 + miles_prev_28 + altitude_delta + jm_age + elapsed_time_m, data = hr_train) %>%
+  step_normalize(all_predictors())
+rec_normal
+```
+
+Check to make sure your recipes are working as expected
+
+## Exercise 3 Create two model specifications
+
+Create a model specification `spec_lm_pen` for a penalized regression (hint see `?details_linear_reg_glmnet` for help).  Set the 2 hyperparameters for tuning.
+
+Create a second model specification `spec_rf` for a random forest regression using ranger (see `?details_rand_forest_ranger`).  Set mtry and min_n for tuning
+
+```{r}
+spec_lm_pen <- linear_reg(penalty = tune(), mixture = tune(), engine = "glmnet")
+spec_lm_pen
+```
+
+```{r}
+spec_rf <- rand_forest(mtry=tune(), min_n=tune(), mode = "regression", engine = "ranger")
+spec_rf
+```
+
+## Exercise 4, Workflow + grid tune
+
+Create a workflow that includes the `rec_simple` recipe and the `spec_lm_pen` model specification.   (Note that while penalized regression is best with normalized predictors, `glmnet` does this conversion by default, do we can just use the simple recipe for it).
+
+```{r}
+lm_pen_wkflow <-
+  workflow() %>%
+  add_recipe(rec_simple) %>%
+  add_model(spec_lm_pen) 
+lm_pen_wkflow
+```
+
+Use the v-fold resampling to fit models and tune the hyper parameters using a grid search with a grid size of 10 (the default).  You'll want to set up parallel processing for this.  How long does it take?
+
+I recommend leaving `save_pred = FALSE` and `save_workflow = FALSE` (these are the defaults).  This is contrary to some of the scripts in the book, but I think Rstudio stays happier with these settings.
+
+Creating a random grid of size 10 for the lm_pen parameters
+
+```{r}
+lm_pen_param <- 
+  lm_pen_wkflow %>%
+  extract_parameter_set_dials()
+lm_pen_param
+lm_pen_param %>% 
+  grid_random(size = 10) %>% # 'size' is the number of combinations
+  summary()
+```
+
+```{r}
+parallel::detectCores(logical = FALSE)
+```
+
+```{r}
+library(doMC)
+registerDoMC(cores = 4)
+```
+
+What is the difference between grid = 10 and grid_random(size = 10)
+
+```{r}
+lm_pen_tune <-
+  lm_pen_wkflow %>%
+  tune_grid(hr_folds,
+            grid = 10,
+            param_info = lm_pen_param)
+ lm_pen_tune 
+```
+
+
+Plot the results and also print a table of the best hyperparameters
+
+```{r}
+autoplot(lm_pen_tune) + 
+  scale_color_viridis_d(direction = -1) + 
+  theme(legend.position = "top")
+```
+
+```{r}
+show_best(lm_pen_tune) %>% select(-.estimator)
+```
+
+
+## Exercise 5: Racing
+
+Repeat Ex 4 but use a grid size of 25 and racing to reduced the amount of time (how much time does it take?)
+
+
+I recommend leaving `save_pred = FALSE` and `save_workflow = FALSE` (these are the defaults).  This is contrary to some of the scripts in the book, but I think Rstudio stays happier with these settings.
+
+```{r}
+library(finetune)
+```
+
+
+```{r}
+lm_pen_tune_25 <-
+  lm_pen_wkflow %>%
+  tune_race_anova(hr_folds,
+                  grid = 25,
+                  param_info = lm_pen_param)
+ lm_pen_tune_25 
+```
+
+
+Plot the results and also print a table of the best models
+
+```{r}
+autoplot(lm_pen_tune_25) + 
+  scale_color_viridis_d(direction = -1) + 
+  theme(legend.position = "top")
+```
+
+```{r}
+show_best(lm_pen_tune_25)
+```
+
+## Exercise 6 workflow set, tuning
+
+Now create a workflow set that uses the `rec_simple` recipe and both of the model specifications that you created earlier. Tune them using racing.  Plot the results and print summaries of the best.  Did the penalized regression or the random forests provide a better fit?  
+
+```{r}
+preproc <- list(simple = rec_simple)
+both_wkflow <-
+  workflow_set(preproc, models = list(lm_pen = spec_lm_pen, rf = spec_rf), cross = TRUE)
+both_wkflow
+```
+
+```{r}
+both_wkflow %>% extract_workflow(id = "simple_lm_pen")
+both_wkflow %>% extract_workflow(id = "simple_rf")
+```
+
+
+```{r}
+both_tune_racing <-
+  both_wkflow %>%
+  workflow_map("tune_race_anova",
+               resamples = hr_folds,
+               grid = 25)
+ both_tune_racing 
+```
+
+(This takes about 2.5 minutes on my mac with 8 cores)
+
+```{r}
+autoplot(
+   both_tune_racing,
+   rank_metric = "rmse",  
+   metric = "rmse",       
+   select_best = TRUE)
+```
+
+
+
+```{r}
+matched_results <- 
+   rank_results(both_tune_racing, select_best = TRUE)
+matched_results
+```
+
+
+## Exercise 7
+Can you figure out how to extract and plot/summarize the data for just the random forest spec?  (create output analagous to what you did for Exercise 5)
+
+```{r}
+rf_only = both_tune_racing %>%
+  extract_workflow_set_result(id = "simple_rf")
+rf_only
+```
+
+```{r}
+autoplot(rf_only) + 
+  scale_color_viridis_d(direction = -1) + 
+  theme(legend.position = "top")
+```
+
+```{r}
+show_best(rf_only)
+```
+
+## Exercise 8
+
+Using the results from Exercise 6 as a starting point, use a Bayesian tune to see if you can further improve the random forest fit.
+
+Hint: you will neeed to use `extract_parameter_set_dials(spec_rf) %>%
+  finalize(rides_train)`  to create a parameter set to feed into the Bayesian tuning function
+  
+```{r}
+bayes_param <- 
+  both_tune_racing %>%
+  extract_parameter_set_dials(id = "simple_rf") %>%
+  finalize(hr_train)
+bayes_param
+```
+```{r}
+rf_wkflow = both_wkflow %>% extract_workflow(id = "simple_rf")
+rf_wkflow
+```
+
+```{r}
+bayes_tune <-
+  rf_wkflow %>%
+  tune_bayes(resamples = hr_folds,
+             initial = rf_only,
+             param_info = bayes_param)
+bayes_tune
+```
+
+```{r}
+show_best(bayes_tune)
+autoplot(bayes_tune, type = "performance")
+autoplot(bayes_tune, type = "parameters")
+```
+
+## Exercise 9
+Now that we have reviewed how this works, fit as many extra models as you would like to come up with the best predictive fit that you can (using racing).  See Chapter 15 for a bunch of possibilities.  Do this is a workflow set (or several workflow sets).  If you use multiple workflow sets you can combine them in the end with `bind_rows`.  Create a table of best models and also plot the metric or metrics from the best models.  (See chapter 15.4)
+
+I did all models from Chapter 15, used racing, used a grid size of 25, and it took a bit under 4 hours
+
+__SAVE THE RESULTS AS AN .Rdata OBJECT FOR FUTURE USE!!__
+
+
+## Exercise 10
+
+Extract the best model from exercise 9 (with its tuned parameters), fit to the test set, check metrics, and plot observed versus predicted (see Chapter 15.5)
