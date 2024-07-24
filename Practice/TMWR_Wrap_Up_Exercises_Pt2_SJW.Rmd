@@ -1,0 +1,187 @@
+---
+title: "TMWR_Final_Exercises_part2"
+author: 
+date: "2024-07-17"
+output: 
+  html_document: 
+    keep_md: yes
+---
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+tidymodels_prefer()
+library(DALEXtra)
+library(vip)
+```
+
+
+Load the data
+
+```{r}
+load("../Practice/TMWR_wrapup_all_race_results.Rdata")
+```
+
+
+## Exercise 1
+
+Retrieve the best model and fit it to the _rides_train_ data set.
+
+```{r}
+all_results %>% 
+   rank_results(rank_metric = "rsq") %>% 
+  # filter(.metric == "rsq") %>% 
+   select(wflow_id, model, .config, rsq = mean, rank)
+```
+
+```{r}
+best_results <- 
+   all_results %>% 
+   extract_workflow_set_result("simple_boosting") %>% 
+   select_best(metric = "rmse")
+best_results
+```
+
+```{r}
+boosting_test_results <- 
+   all_results %>% 
+   extract_workflow("simple_boosting") %>% 
+   finalize_workflow(best_results) %>% 
+   last_fit(split = rides_split)
+```
+
+```{r}
+model.fit.2 <-
+  boosting_test_results %>% 
+  extract_workflow("simple_boosting") %>%
+  fit(data = rides_train)
+```
+
+## Exercise 2
+
+Find local explanations for how the model predicts the 1000th and 10000th observation in the training data set.  Plot the results.
+
+Prepare appropriate data and then create an explainer
+
+```{r}
+vip_features <- c("distance", "altitude", "speed", "cadence", "temperature", "miles_prev_14", "miles_prev_28", "altitude_delta", "jm_age", "elapsed_time_m","name","date","timestamp")
+
+vip_train <- 
+  rides_train %>% 
+  select(all_of(vip_features))
+
+explainer <- 
+  explain_tidymodels(
+    model.fit.2, 
+    data = vip_train, 
+    y = rides_train$heart_rate,
+    verbose = FALSE
+  )
+```
+
+```{r}
+hr.1000 = vip_train[1000,]
+hr.1000
+```
+
+```{r}
+hr.10000 = vip_train[10000,]
+hr.10000
+```
+jm_age is most important, positive
+
+```{r}
+mod_breakdown.1000 <- predict_parts(explainer = explainer, new_observation = hr.1000)
+mod_breakdown.1000
+```
+
+jm.age is most important but in opposite direction (negative)
+
+```{r}
+mod_breakdown.10000 <- predict_parts(explainer = explainer, new_observation = hr.10000)
+mod_breakdown.10000
+```
+
+```{r}
+set.seed(1801)
+ride_1000 <- 
+  predict_parts(
+    explainer = explainer, new_observation = hr.1000, 
+    type = "shap",
+    B = 20
+  )
+```
+
+```{r}
+ride_1000 %>%
+  group_by(variable) %>%
+  mutate(mean_val = mean(contribution)) %>%
+  ungroup() %>%
+  mutate(variable = fct_reorder(variable, abs(mean_val))) %>%
+  ggplot(aes(contribution, variable, fill = mean_val > 0)) +
+  geom_col(data = ~distinct(., variable, mean_val), 
+           aes(mean_val, variable), 
+           alpha = 0.5) +
+  geom_boxplot(width = 0.5) +
+  theme(legend.position = "none") +
+  scale_fill_viridis_d() +
+  labs(y = NULL)
+```
+
+```{r}
+set.seed(1801)
+ride_10000 <- 
+  predict_parts(
+    explainer = explainer, new_observation = hr.10000, 
+    type = "shap",
+    B = 20
+  )
+```
+
+```{r}
+ride_10000 %>%
+  group_by(variable) %>%
+  mutate(mean_val = mean(contribution)) %>%
+  ungroup() %>%
+  mutate(variable = fct_reorder(variable, abs(mean_val))) %>%
+  ggplot(aes(contribution, variable, fill = mean_val > 0)) +
+  geom_col(data = ~distinct(., variable, mean_val), 
+           aes(mean_val, variable), 
+           alpha = 0.5) +
+  geom_boxplot(width = 0.5) +
+  theme(legend.position = "none") +
+  scale_fill_viridis_d() +
+  labs(y = NULL)
+```
+
+
+## Exercise 3
+
+Determine global variable importance and plot the results. Feel free to use the default plotting methods instead of the one in the book. Explain the x-axis.
+ 
+```{r}
+set.seed(1803)
+vip_global <- model_parts(explainer, loss_function = loss_root_mean_square)
+```
+
+The x-axis tells us how much worse the RMSE is when that variable is removed from the model.
+
+```{r}
+plot(vip_global)
+```
+
+
+## Exercise 4
+
+Create a partial dependence profile for the four most important variables from exercise 3.  Plot (again using the default instead of the code from the book is fine).  Does this help explain why the boosting tree model is better than linear regression?
+
+```{r}
+set.seed(1806)
+pdp_liv <- model_profile(explainer, N = 1000, 
+                         variables = c("jm_age","altitude_delta","distance","speed"))
+```
+
+```{r}
+plot(pdp_liv)
+```
+
