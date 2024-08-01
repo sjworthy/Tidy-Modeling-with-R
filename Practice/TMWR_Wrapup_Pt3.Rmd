@@ -1,0 +1,86 @@
+---
+title: "TMWR_Final_Exercises_part3"
+author: "Sam Worthy"
+date: "2024-08-01"
+output: 
+  html_document: 
+    keep_md: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+tidymodels_prefer()
+library(stacks)
+library(rules)
+library(baguette)
+library(finetune)
+```
+
+Load the data
+
+```{r}
+load("../Practice/TMWR_wrapup_all_race_results_save.Rdata")
+```
+
+Create empty data stack then add models
+
+```{r}
+hr_stack = stacks() %>%
+  add_candidates(all_race_results_save)
+hr_stack
+```
+
+Blend the predictions
+
+```{r}
+set.seed(2001)
+ens <- blend_predictions(hr_stack)
+```
+
+```{r}
+autoplot(ens)
+```
+
+```{r}
+set.seed(2002)
+ens <- blend_predictions(hr_stack, penalty = 10^seq(-2, -0.5, length = 20))
+```
+
+```{r}
+autoplot(ens)
+```
+
+```{r}
+ens
+```
+
+```{r}
+autoplot(ens, "weights") +
+  geom_text(aes(x = weight + 0.01, label = model), hjust = 0) + 
+  theme(legend.position = "none") +
+  lims(x = c(-0.01, 0.8))
+```
+
+Fit the member models
+
+```{r}
+ens <- fit_members(ens)
+```
+
+Test set results
+
+```{r}
+reg_metrics <- metric_set(rmse, rsq)
+ens_test_pred <- 
+  predict(ens, rides_test) %>% 
+  bind_cols(rides_test)
+
+ens_test_pred %>% 
+  reg_metrics(heart_rate, .pred)
+```
+
