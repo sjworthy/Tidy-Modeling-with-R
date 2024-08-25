@@ -99,6 +99,7 @@ final.data %>%
 
 ```{r}
 poisson.test(c(718, 759), T = 1)
+poisson.test(c(718, 759), T = c(99,101))
 ```
 
 Making the results tidy
